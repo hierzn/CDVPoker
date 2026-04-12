@@ -26,7 +26,7 @@ from telegram.ext import (
 # ─────────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8385498157:AAF9Kh7Y2XbS4kixWsviFZHQEh9uGspF6aI")
 DB_FILE   = "poker_tournament.db"
 
 # Superadmin Telegram User-IDs (kommagetrennt als Env-Variable)
