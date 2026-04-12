@@ -32,7 +32,7 @@ DB_FILE   = "poker_tournament.db"
 # Superadmin Telegram User-IDs (kommagetrennt als Env-Variable)
 # In Railway setzen: SUPERADMIN_IDS=123456789,987654321
 # Deine Telegram-ID findest du mit @userinfobot
-_raw_ids = os.environ.get("SUPERADMIN_IDS", "")
+_raw_ids = os.environ.get("SUPERADMIN_IDS", "494730002")
 SUPERADMIN_IDS: set[int] = {int(x.strip()) for x in _raw_ids.split(",") if x.strip().isdigit()}
 
 # ─────────────────────────────────────────────
