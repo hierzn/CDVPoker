@@ -1,42 +1,103 @@
 """
-🃏 CDVPoker Telegram Bot — v3.0
+🃏 CDVPoker Telegram Bot — v4.0
 ================================
 Requirements:
     pip install "python-telegram-bot[job-queue]==21.9" matplotlib
 
-Setup:
-    BOT_TOKEN als Umgebungsvariable setzen (Railway → Variables)
-    SUPERADMIN_IDS = Telegram User-IDs der Superadmins (kommagetrennt)
+Railway Variables to set:
+    BOT_TOKEN        = your telegram bot token
+    SUPERADMIN_IDS   = 123456789,987654321   (comma-separated telegram user IDs)
+    DB_PATH          = /data/poker.db        (optional, default: poker_tournament.db)
+
+Security:
+    - Private GitHub repo = code is safe
+    - BOT_TOKEN never in code, always via env variable
+    - Admin commands protected by user ID check
+    - /importdb admin-only
 """
 
 import asyncio
+import io
 import json
 import logging
 import os
+import shutil
 import sqlite3
+import tempfile
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Callable
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Document
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ContextTypes, MessageHandler, filters
 )
 
 # ─────────────────────────────────────────────
-#  CONFIG
+#  CONFIG  (all secrets via environment)
 # ─────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8385498157:AAF9Kh7Y2XbS4kixWsviFZHQEh9uGspF6aI")
-DB_FILE   = "poker_tournament.db"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+DB_FILE   = os.environ.get("DB_PATH", "poker_tournament.db")
 
-# Superadmin Telegram User-IDs (kommagetrennt als Env-Variable)
-# In Railway setzen: SUPERADMIN_IDS=123456789,987654321
-# Deine Telegram-ID findest du mit @userinfobot
-_raw_ids = os.environ.get("SUPERADMIN_IDS", "494730002")
+_raw_ids = os.environ.get("SUPERADMIN_IDS", "")
 SUPERADMIN_IDS: set[int] = {int(x.strip()) for x in _raw_ids.split(",") if x.strip().isdigit()}
 
 # ─────────────────────────────────────────────
-#  VORDEFINIERTE CHIP-SETS  ← hier anpassen!
+#  CHANGELOG  ← update this when you deploy!
+# ─────────────────────────────────────────────
+CHANGELOG = [
+    {
+        "version": "v4.0",
+        "date": "2025-04",
+        "changes": [
+            "🆕 Dynamische Spieleranzahl — kein fixer Wert mehr beim Start",
+            "🆕 /importdb — Datenbank per Datei importieren",
+            "🆕 /changelog — dieser Screen",
+            "🆕 Private Repo Support — Token nur via Env-Variable",
+            "🔧 Payout-Fix: Platz 4 bekommt exakt Buy-In zurück, Rest 50/30/20",
+            "🔧 Post-game: Kurze Summary für alle, Detail-Charts für alle",
+            "🔧 Leere DB beim ersten Start — Spieler werden dynamisch angelegt",
+            "🔧 /newgame ohne feste Spielerzahl — berechnet sich aus /addplayer",
+        ],
+    },
+    {
+        "version": "v3.0",
+        "date": "2025-03",
+        "changes": [
+            "🆕 Admin/Superadmin System mit /adminpanel",
+            "🆕 Button-Menü für Spieler-Auswahl (/addplayer)",
+            "🆕 2 vordefinierte Chip-Sets (/chipset)",
+            "🆕 Alte Turniere eintragen (/addhistory)",
+            "🆕 Turnier löschen (/deletetournament)",
+            "🔧 Bustout-Bug gefixt — kein Auto-Bustout mehr",
+            "🔧 Blind-Timer stoppt automatisch bei Turnierende",
+        ],
+    },
+    {
+        "version": "v2.0",
+        "date": "2025-02",
+        "changes": [
+            "🆕 Dynamische Blind-Level basierend auf Turnierdauer",
+            "🆕 Frühe Level 40% länger für mehr Spielspaß",
+            "🆕 Profit-Charts nach Turnier (matplotlib)",
+            "🆕 Kumulativer Verlauf bei /playerstats",
+            "🆕 Individuelle Spieler-Zusammenfassung nach Turnier",
+        ],
+    },
+    {
+        "version": "v1.0",
+        "date": "2025-01",
+        "changes": [
+            "🎉 Erster Release",
+            "🆕 Turnier-Setup, Chip-Berechnung, Payout",
+            "🆕 Shot Clock mit Blind-Struktur",
+            "🆕 Spieler-Statistik & Leaderboard",
+        ],
+    },
+]
+
+# ─────────────────────────────────────────────
+#  CHIP-SETS  ← hier anpassen!
 # ─────────────────────────────────────────────
 CHIPSETS = {
     "1": {
@@ -50,7 +111,7 @@ CHIPSETS = {
 }
 
 # ─────────────────────────────────────────────
-#  VORDEFINIERTE SPIELER-LISTE  ← hier anpassen!
+#  PRESET PLAYERS  ← hier anpassen!
 # ─────────────────────────────────────────────
 PRESET_PLAYERS = [
     "Dominik", "Alex", "Max", "Jonas", "Lukas",
@@ -92,23 +153,46 @@ def get_active_blind_levels() -> list[dict]:
 
 
 # ─────────────────────────────────────────────
-#  PAYOUT STRUCTURES
+#  PAYOUT — Platz 4 bekommt exakt Buy-In zurück
 # ─────────────────────────────────────────────
-def get_payout_structure(num_players: int) -> list[dict]:
+def get_payout_structure(num_players: int, buyin: float, total_pot: float) -> list[dict]:
+    """
+    Returns list of {place, amount} dicts.
+    For 9+ players: place 4 gets exactly buyin back, rest split 50/30/20.
+    For 6-8 players: top 3 split 50/30/20.
+    For 5 or less: top 2 split 65/35.
+    """
     if num_players <= 5:
-        return [{"place": 1, "percent": 65}, {"place": 2, "percent": 35}]
-    elif num_players <= 8:
-        return [{"place": 1, "percent": 50}, {"place": 2, "percent": 30}, {"place": 3, "percent": 20}]
-    elif num_players <= 10:
-        # 4th gets buy-in back
         return [
-            {"place": 1, "percent": 45}, {"place": 2, "percent": 27},
-            {"place": 3, "percent": 18}, {"place": 4, "percent": 10},
+            {"place": 1, "amount": round(total_pot * 0.65, 2)},
+            {"place": 2, "amount": round(total_pot * 0.35, 2)},
+        ]
+    elif num_players <= 8:
+        return [
+            {"place": 1, "amount": round(total_pot * 0.50, 2)},
+            {"place": 2, "amount": round(total_pot * 0.30, 2)},
+            {"place": 3, "amount": round(total_pot * 0.20, 2)},
+        ]
+    elif num_players <= 11:
+        # Platz 4 bekommt exakt Buy-In zurück
+        place4_amount = buyin
+        remaining = total_pot - place4_amount
+        return [
+            {"place": 1, "amount": round(remaining * 0.50, 2)},
+            {"place": 2, "amount": round(remaining * 0.30, 2)},
+            {"place": 3, "amount": round(remaining * 0.20, 2)},
+            {"place": 4, "amount": place4_amount},
         ]
     else:
+        # 12+ players: top 5, Platz 4+5 bekommen Buy-In zurück
+        place45 = buyin
+        remaining = total_pot - (place45 * 2)
         return [
-            {"place": 1, "percent": 40}, {"place": 2, "percent": 25},
-            {"place": 3, "percent": 17}, {"place": 4, "percent": 11}, {"place": 5, "percent": 7},
+            {"place": 1, "amount": round(remaining * 0.50, 2)},
+            {"place": 2, "amount": round(remaining * 0.30, 2)},
+            {"place": 3, "amount": round(remaining * 0.20, 2)},
+            {"place": 4, "amount": place45},
+            {"place": 5, "amount": place45},
         ]
 
 
@@ -133,8 +217,7 @@ def init_db():
         num_players INTEGER,
         buyin_amount REAL,
         total_pot REAL,
-        chip_config TEXT,
-        chips_per_player INTEGER,
+        chip_config TEXT DEFAULT '{}',
         status TEXT DEFAULT 'setup',
         notes TEXT DEFAULT ''
     )""")
@@ -188,12 +271,12 @@ def db_del(key: str):
 def clear_session():
     for key in ["active_players", "buyin_amount", "chip_config",
                 "current_blind_level", "blind_start_time", "blind_running",
-                "busted_players", "blind_levels"]:
+                "busted_players", "blind_levels", "tournament_duration"]:
         db_del(key)
 
 
 # ─────────────────────────────────────────────
-#  PERMISSION HELPERS
+#  PERMISSIONS
 # ─────────────────────────────────────────────
 def is_superadmin(user_id: int) -> bool:
     return user_id in SUPERADMIN_IDS
@@ -219,7 +302,7 @@ async def require_admin(update: Update) -> bool:
 
 async def require_superadmin(update: Update) -> bool:
     if not is_superadmin(update.effective_user.id):
-        await update.message.reply_text("⛔ Nur Superadmins können diesen Befehl nutzen.")
+        await update.message.reply_text("⛔ Nur Superadmins.")
         return False
     return True
 
@@ -231,11 +314,11 @@ def calculate_chip_distribution(chip_config: dict, num_players: int) -> dict:
     chips_per_player = {}
     value_per_player = 0
     for denom, count in chip_config.items():
-        per_player = count // num_players
-        chips_per_player[denom] = per_player
-        value_per_player += int(denom) * per_player
-    total_value = sum(int(d) * c for d, c in chip_config.items())
-    return {"chips_per_player": chips_per_player, "value_per_player": value_per_player, "total_value": total_value}
+        per = count // num_players
+        chips_per_player[denom] = per
+        value_per_player += int(denom) * per
+    total = sum(int(d) * c for d, c in chip_config.items())
+    return {"chips_per_player": chips_per_player, "value_per_player": value_per_player, "total_value": total}
 
 
 # ─────────────────────────────────────────────
@@ -243,32 +326,30 @@ def calculate_chip_distribution(chip_config: dict, num_players: int) -> dict:
 # ─────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    admin_mark = " 👑" if is_superadmin(uid) else (" 🔑" if is_admin(uid) else "")
+    mark = " 👑" if is_superadmin(uid) else (" 🔑" if is_admin(uid) else "")
     text = (
-        f"🃏 *CDVPoker Bot{admin_mark}*\n\n"
+        f"🃏 *CDVPoker Bot v4.0{mark}*\n\n"
         "🎮 *Turnier*\n"
-        "`/newgame 6 20 3h` — Turnier starten\n"
-        "`/addplayer` — Spieler wählen (Button-Menü)\n"
+        "`/newgame 20 3h` — Turnier starten (Buy-In, Dauer)\n"
+        "`/addplayer` — Spieler wählen (Buttons)\n"
         "`/chipset` — Chip-Set wählen\n"
         "`/calculate` — Chip-Verteilung\n"
         "`/payout` — Payouts anzeigen\n"
-        "`/bustout` — Spieler ausscheiden (Buttons)\n"
-        "`/endtournament` — Turnier beenden & auswerten\n\n"
+        "`/bustout` — Spieler ausscheiden\n"
+        "`/endtournament` — Turnier beenden\n\n"
         "⏱ *Shot Clock*\n"
         "`/shotclock` — Timer starten\n"
         "`/blinds` — Aktuelle Blinds & Zeit\n"
-        "`/blindstructure` — Alle Level\n"
-        "`/nextlevel` — Nächstes Level\n"
-        "`/stopblind` — Timer stoppen\n\n"
+        "`/nextlevel` `/stopblind` `/blindstructure`\n\n"
         "📊 *Statistik*\n"
         "`/stats` — Leaderboard\n"
-        "`/playerstats [Name]` — Spieler-Stats + Grafik\n"
+        "`/playerstats [Name]` — Stats + Grafik\n"
         "`/status` — Turnierstatus\n\n"
         "🔑 *Admin*\n"
-        "`/adminpanel` — Admin-Funktionen\n"
-        "`/addadmin ID Name` — Admin hinzufügen\n"
-        "`/addhistory` — Altes Turnier eintragen\n"
-        "`/deletetournament` — Turnier löschen\n"
+        "`/adminpanel` — Admin-Funktionen\n\n"
+        "📋 *Info*\n"
+        "`/changelog` — Was ist neu?\n"
+        "`/help` — Diese Hilfe\n"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -278,125 +359,79 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
-#  ADMIN PANEL
+#  /changelog
 # ─────────────────────────────────────────────
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update):
-        return
-    keyboard = [
-        [InlineKeyboardButton("👥 Admins verwalten", callback_data="adm_list_admins")],
-        [InlineKeyboardButton("🗑 Turnier löschen", callback_data="adm_del_tournament"),
-         InlineKeyboardButton("📥 Altes Turnier eintragen", callback_data="adm_add_history")],
-        [InlineKeyboardButton("🔄 Statistik zurücksetzen", callback_data="adm_reset_stats")],
-        [InlineKeyboardButton("🧹 Session leeren", callback_data="adm_clear_session")],
-    ]
-    await update.message.reply_text(
-        "🔑 *Admin-Panel*", parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_superadmin(update):
-        return
-    if len(context.args) < 2:
-        await update.message.reply_text("Verwendung: `/addadmin 123456789 Username`", parse_mode="Markdown")
-        return
-    try:
-        uid = int(context.args[0])
-        uname = context.args[1]
-    except ValueError:
-        await update.message.reply_text("❌ Ungültige User-ID.")
-        return
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("INSERT OR REPLACE INTO admins (user_id, username, role) VALUES (?,?,?)", (uid, uname, "admin"))
-    conn.commit()
-    conn.close()
-    await update.message.reply_text(f"✅ *{uname}* ({uid}) ist jetzt Admin!", parse_mode="Markdown")
-
-
-async def remove_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_superadmin(update):
-        return
-    if not context.args:
-        await update.message.reply_text("Verwendung: `/removeadmin 123456789`", parse_mode="Markdown")
-        return
-    try:
-        uid = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Ungültige User-ID.")
-        return
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("DELETE FROM admins WHERE user_id=?", (uid,))
-    conn.commit()
-    conn.close()
-    await update.message.reply_text(f"✅ Admin {uid} entfernt.")
+async def changelog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = ["📋 *CDVPoker — Changelog*\n"]
+    for entry in CHANGELOG:
+        lines.append(f"*{entry['version']}* — _{entry['date']}_")
+        for change in entry["changes"]:
+            lines.append(f"  {change}")
+        lines.append("")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 # ─────────────────────────────────────────────
-#  NEW GAME
+#  NEW GAME — no fixed player count, dynamic!
 # ─────────────────────────────────────────────
 async def new_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update):
         return
     clear_session()
-    if len(context.args) >= 3:
+
+    # Usage: /newgame BUYIN DURATION
+    # e.g.   /newgame 20 3h
+    if len(context.args) >= 2:
         try:
-            num_players = int(context.args[0])
-            buyin = float(context.args[1])
-            dur_str = context.args[2].lower().replace("h", "").replace("std", "")
+            buyin = float(context.args[0])
+            dur_str = context.args[1].lower().replace("h", "").replace("std", "")
             total_minutes = int(float(dur_str) * 60)
-            await _setup_tournament(update.message.reply_text, num_players, buyin, total_minutes)
+            db_set("buyin_amount", str(buyin))
+            db_set("tournament_duration", str(total_minutes))
+            levels = build_blind_levels(total_minutes)
+            db_set("blind_levels", json.dumps(levels))
+
+            blind_preview = [
+                f"  Lvl {l['level']}: {l['small']:,}/{l['big']:,} — {l['minutes']}min"
+                + (" 🔒" if l['level'] <= 3 else "")
+                for l in levels[:4]
+            ]
+            blind_preview.append(f"  ... ({len(levels)} Level, {sum(l['minutes'] for l in levels)} min)")
+
+            await update.message.reply_text(
+                f"🎰 *Turnier eingerichtet!*\n\n"
+                f"💶 Buy-In: *{buyin:.0f}€*\n"
+                f"⏱ Geplante Dauer: *{total_minutes//60}h{total_minutes%60:02d}m*\n\n"
+                f"🎯 *Blind-Vorschau:*\n" + "\n".join(blind_preview) + "\n\n"
+                f"📋 *Nächste Schritte:*\n"
+                f"1️⃣ /addplayer — Spieler wählen\n"
+                f"2️⃣ /chipset — Chip-Set wählen\n"
+                f"   _(Payouts & Chips werden nach Spielerwahl berechnet)_\n"
+                f"3️⃣ /shotclock — Timer starten\n"
+                f"4️⃣ /bustout — Bustouts eintragen",
+                parse_mode="Markdown"
+            )
             return
         except (ValueError, IndexError):
             pass
+
     await update.message.reply_text(
         "🎰 *Neues Turnier*\n\n"
-        "`/newgame [Spieler] [Buy-In €] [Dauer]`\n\n"
+        "`/newgame [Buy-In €] [Dauer]`\n\n"
         "Beispiele:\n"
-        "`/newgame 6 20 3h`\n`/newgame 8 15 2.5h`\n`/newgame 10 25 4h`",
-        parse_mode="Markdown"
-    )
-
-
-async def _setup_tournament(reply_fn, num_players: int, buyin: float, total_minutes: int):
-    levels = build_blind_levels(total_minutes)
-    db_set("blind_levels", json.dumps(levels))
-    db_set("buyin_amount", str(buyin))
-    total_pot = buyin * num_players
-    structure = get_payout_structure(num_players)
-    place_map = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-    payout_lines = [
-        f"{place_map[e['place']-1]} Platz {e['place']}: {e['percent']}% = *{total_pot * e['percent'] / 100:.2f}€*"
-        for e in structure
-    ]
-    blind_preview = [
-        f"  Lvl {l['level']}: {l['small']:,}/{l['big']:,} — {l['minutes']}min" + (" 🔒" if l['level'] <= 3 else "")
-        for l in levels[:4]
-    ]
-    blind_preview.append(f"  ... ({len(levels)} Level, {sum(l['minutes'] for l in levels)} min gesamt)")
-    await reply_fn(
-        f"🎰 *Turnier eingerichtet!*\n\n"
-        f"👥 {num_players} Spieler  |  💶 {buyin:.0f}€ Buy-In  |  🏆 {total_pot:.0f}€ Pot\n"
-        f"⏱ {total_minutes/60:.1f}h geplant\n\n"
-        f"💰 *Payouts:*\n" + "\n".join(payout_lines) + "\n\n"
-        f"🎯 *Blind-Vorschau:*\n" + "\n".join(blind_preview) + "\n\n"
-        f"📋 *Nächste Schritte:*\n"
-        f"1️⃣ /addplayer — Spieler wählen\n"
-        f"2️⃣ /chipset — Chip-Set wählen\n"
-        f"3️⃣ /shotclock — Timer starten\n"
-        f"4️⃣ /bustout — Bustouts eintragen",
+        "`/newgame 20 3h`\n`/newgame 15 2.5h`\n`/newgame 25 4h`\n\n"
+        "_Spieleranzahl wird automatisch aus /addplayer berechnet!_",
         parse_mode="Markdown"
     )
 
 
 # ─────────────────────────────────────────────
-#  ADD PLAYER — Button-Menü
+#  PLAYER MENU
 # ─────────────────────────────────────────────
 def _build_player_keyboard(active: list) -> list:
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT name FROM players ORDER BY name")
+    c.execute("SELECT name FROM players ORDER BY total_tournaments DESC, name ASC")
     db_players = [row[0] for row in c.fetchall()]
     conn.close()
     all_known = list(dict.fromkeys(PRESET_PLAYERS + db_players))
@@ -417,26 +452,6 @@ def _build_player_keyboard(active: list) -> list:
     return keyboard
 
 
-async def add_player_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.args:
-        name = " ".join(context.args).strip()
-        _toggle_player(name)
-        active = json.loads(db_get("active_players") or "[]")
-        action = "hinzugefügt" if name in active else "entfernt"
-        await update.message.reply_text(
-            f"✅ *{name}* {action}!\n👥 Spieler: {', '.join(active)} ({len(active)})",
-            parse_mode="Markdown"
-        )
-    else:
-        active = json.loads(db_get("active_players") or "[]")
-        active_display = ", ".join(active) if active else "noch niemand"
-        await update.message.reply_text(
-            f"👥 *Spieler auswählen*\n\nAktuell dabei: _{active_display}_",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(_build_player_keyboard(active))
-        )
-
-
 def _toggle_player(name: str):
     active = json.loads(db_get("active_players") or "[]")
     conn = sqlite3.connect(DB_FILE)
@@ -450,6 +465,25 @@ def _toggle_player(name: str):
     db_set("active_players", json.dumps(active))
 
 
+async def add_player_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        name = " ".join(context.args).strip()
+        _toggle_player(name)
+        active = json.loads(db_get("active_players") or "[]")
+        action = "hinzugefügt" if name in active else "entfernt"
+        await update.message.reply_text(
+            f"✅ *{name}* {action}! ({len(active)} Spieler)",
+            parse_mode="Markdown"
+        )
+    else:
+        active = json.loads(db_get("active_players") or "[]")
+        await update.message.reply_text(
+            f"👥 *Spieler auswählen*\n\nAktuell: _{', '.join(active) if active else 'niemand'}_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(_build_player_keyboard(active))
+        )
+
+
 async def remove_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Verwendung: `/removeplayer Name`", parse_mode="Markdown")
@@ -457,7 +491,7 @@ async def remove_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = " ".join(context.args).strip()
     active = json.loads(db_get("active_players") or "[]")
     if name not in active:
-        await update.message.reply_text(f"❌ {name} nicht in der aktuellen Runde.")
+        await update.message.reply_text(f"❌ {name} nicht dabei.")
         return
     active.remove(name)
     db_set("active_players", json.dumps(active))
@@ -469,12 +503,14 @@ async def list_players(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not active:
         await update.message.reply_text("👥 Keine Spieler. /addplayer benutzen.")
         return
-    lines = [f"  {i+1}. {p}" for i, p in enumerate(active)]
-    await update.message.reply_text(f"👥 *Spieler ({len(active)}):*\n\n" + "\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text(
+        f"👥 *Spieler ({len(active)}):*\n\n" + "\n".join(f"  {i+1}. {p}" for i, p in enumerate(active)),
+        parse_mode="Markdown"
+    )
 
 
 # ─────────────────────────────────────────────
-#  CHIPSET
+#  CHIPSET + CALCULATE  (dynamic player count)
 # ─────────────────────────────────────────────
 async def chipset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -504,8 +540,9 @@ async def set_chips(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _show_chip_summary(update.message.reply_text, chip_config)
 
 
-async def _show_chip_summary(reply_fn, chip_config: dict):
+async def _show_chip_summary(reply_fn: Callable, chip_config: dict):
     active = json.loads(db_get("active_players") or "[]")
+    buyin_str = db_get("buyin_amount")
     num = len(active)
     total = sum(int(d) * c for d, c in chip_config.items())
     lines = [f"  • {d}er: {c} Stück" for d, c in sorted(chip_config.items(), key=lambda x: int(x[0]))]
@@ -513,7 +550,15 @@ async def _show_chip_summary(reply_fn, chip_config: dict):
     if num > 0:
         dist = calculate_chip_distribution(chip_config, num)
         dist_lines = [f"  • {d}er: {c} Stück" for d, c in sorted(dist["chips_per_player"].items(), key=lambda x: int(x[0]))]
-        text += f"\n\n🎯 *Pro Spieler ({num}):*\n" + "\n".join(dist_lines) + f"\n💰 Startwert: *{dist['value_per_player']:,}*"
+        text += f"\n\n🎯 *Pro Spieler ({num}):*\n" + "\n".join(dist_lines)
+        text += f"\n💰 Startwert: *{dist['value_per_player']:,}*"
+    if buyin_str and num > 0:
+        buyin = float(buyin_str)
+        pot = buyin * num
+        structure = get_payout_structure(num, buyin, pot)
+        place_map = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        payout_lines = [f"{place_map[e['place']-1]} Platz {e['place']}: *{e['amount']:.2f}€*" for e in structure]
+        text += f"\n\n💰 *Payouts ({num} Spieler, {pot:.0f}€ Pot):*\n" + "\n".join(payout_lines)
     await reply_fn(text, parse_mode="Markdown")
 
 
@@ -526,7 +571,7 @@ async def calculate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
-#  PAYOUT
+#  PAYOUT  (dynamic)
 # ─────────────────────────────────────────────
 async def payout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buyin_str = db_get("buyin_amount")
@@ -544,13 +589,15 @@ async def payout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     active = json.loads(db_get("active_players") or "[]")
     num = len(active) if active else 6
-    total_pot = buyin * num
-    structure = get_payout_structure(num)
+    pot = buyin * num
+    structure = get_payout_structure(num, buyin, pot)
     place_map = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-    lines = [f"{place_map[e['place']-1]} Platz {e['place']}: {e['percent']}% = *{total_pot * e['percent'] / 100:.2f}€*"
-             for e in structure]
+    lines = [f"{place_map[e['place']-1]} Platz {e['place']}: *{e['amount']:.2f}€*" for e in structure]
+    note = ""
+    if num >= 9:
+        note = f"\n\n_ℹ️ Platz 4 bekommt exakt den Buy-In ({buyin:.0f}€) zurück_"
     await update.message.reply_text(
-        f"💰 *Payouts — {num} Spieler | {buyin:.0f}€ BI | {total_pot:.0f}€ Pot*\n\n" + "\n".join(lines),
+        f"💰 *Payouts — {num} Spieler | {buyin:.0f}€ BI | {pot:.0f}€ Pot*\n\n" + "\n".join(lines) + note,
         parse_mode="Markdown"
     )
 
@@ -566,39 +613,28 @@ async def bustout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _build_bustout_keyboard(remaining: list, busted: list) -> tuple[str, list]:
     place_map = {1: "🥇", 2: "🥈", 3: "🥉"}
-    keyboard = []
-    for name in remaining:
-        keyboard.append([InlineKeyboardButton(f"💀 {name} ausscheiden", callback_data=f"bust_{name}")])
-    busted_lines = ""
+    keyboard = [[InlineKeyboardButton(f"💀 {name} ausscheiden", callback_data=f"bust_{name}")] for name in remaining]
+    busted_display = ""
     if busted:
-        lines = []
-        for b in sorted(busted, key=lambda x: x["place"]):
-            e = place_map.get(b["place"], f"#{b['place']}")
-            lines.append(f"{e} {b['name']}")
-        busted_lines = "\n\nAusgeschieden:\n" + "\n".join(lines)
+        sorted_busted = sorted(busted, key=lambda x: x["place"])
+        lines = [f"{place_map.get(b['place'], '#'+str(b['place']))} {b['name']}" for b in sorted_busted]
+        busted_display = "\n\nAusgeschieden:\n" + "\n".join(lines)
     keyboard.append([InlineKeyboardButton("🏁 Turnier beenden & auswerten", callback_data="finish_tournament")])
-    return busted_lines, keyboard
+    return busted_display, keyboard
 
 
-async def _send_bustout_menu(reply_fn, edit_fn=None):
+async def _send_bustout_menu(reply_fn: Callable, edit_fn: Optional[Callable] = None):
     players = json.loads(db_get("active_players") or "[]")
     busted = json.loads(db_get("busted_players") or "[]")
-    busted_names = [b["name"] for b in busted]
+    busted_names = {b["name"] for b in busted}
     remaining = [p for p in players if p not in busted_names]
-
     if not remaining:
-        text = "✅ Alle ausgeschieden! /endtournament aufrufen."
         fn = edit_fn or reply_fn
-        await fn(text)
+        await fn("✅ Alle ausgeschieden! /endtournament aufrufen.")
         return
-
-    busted_lines, keyboard = _build_bustout_keyboard(remaining, busted)
-    text = (
-        f"💀 *Bustout-Menü*\n\n"
-        f"Noch im Spiel: *{len(remaining)}* von {len(players)}"
-        + busted_lines
-        + "\n\nWer scheidet aus?"
-    )
+    busted_display, keyboard = _build_bustout_keyboard(remaining, busted)
+    text = (f"💀 *Bustout-Menü*\n\nNoch im Spiel: *{len(remaining)}* von {len(players)}"
+            + busted_display + "\n\nWer scheidet aus?")
     fn = edit_fn or reply_fn
     await fn(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -606,23 +642,19 @@ async def _send_bustout_menu(reply_fn, edit_fn=None):
 async def _handle_bustout(query, name: str, context: ContextTypes.DEFAULT_TYPE):
     players = json.loads(db_get("active_players") or "[]")
     busted = json.loads(db_get("busted_players") or "[]")
-    busted_names = [b["name"] for b in busted]
-
+    busted_names = {b["name"] for b in busted}
     if name not in players:
         await query.answer(f"❌ {name} ist kein aktiver Spieler!")
         return
     if name in busted_names:
-        await query.answer(f"⚠️ {name} ist bereits ausgeschieden!")
+        await query.answer(f"⚠️ {name} bereits ausgeschieden!")
         return
-
     remaining = [p for p in players if p not in busted_names]
     place = len(remaining)
     busted.append({"name": name, "place": place})
     db_set("busted_players", json.dumps(busted))
     await query.answer(f"💀 {name} — Platz {place}")
-
-    remaining_after = [p for p in players if p not in [b["name"] for b in busted]]
-
+    remaining_after = [p for p in players if p not in {b["name"] for b in busted}]
     if len(remaining_after) == 1:
         winner = remaining_after[0]
         busted.append({"name": winner, "place": 1})
@@ -630,17 +662,14 @@ async def _handle_bustout(query, name: str, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"🏆 *{winner} GEWINNT!*\n\nLetzter Bustout: 💀 {name} (Platz {place})\n\n_/endtournament für die Auswertung_",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🏁 Auswertung starten", callback_data="finish_tournament")
-            ]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏁 Auswertung starten", callback_data="finish_tournament")]])
         )
         return
-
     await _send_bustout_menu(None, edit_fn=query.edit_message_text)
 
 
 # ─────────────────────────────────────────────
-#  END TOURNAMENT
+#  END TOURNAMENT  +  REPORTS
 # ─────────────────────────────────────────────
 async def end_tournament(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update):
@@ -648,18 +677,18 @@ async def end_tournament(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _finalize_tournament(update.message.reply_text, context)
 
 
-async def _finalize_tournament(reply_fn, context: ContextTypes.DEFAULT_TYPE):
-    db_set("blind_running", "0")  # Stop timer immediately!
+async def _finalize_tournament(reply_fn: Callable, context: ContextTypes.DEFAULT_TYPE):
+    db_set("blind_running", "0")
 
     players = json.loads(db_get("active_players") or "[]")
-    busted = json.loads(db_get("busted_players") or "[]")
-    buyin_str = db_get("buyin_amount")
-    buyin = float(buyin_str) if buyin_str else 0.0
+    busted  = json.loads(db_get("busted_players") or "[]")
+    buyin   = float(db_get("buyin_amount") or "0")
 
     if not players:
-        await reply_fn("❌ Keine aktiven Spieler. Zuerst /newgame und /addplayer.")
+        await reply_fn("❌ Keine aktiven Spieler.")
         return
 
+    # Build placement order
     if busted:
         ordered = sorted(busted, key=lambda x: x["place"])
         placements = [b["name"] for b in ordered]
@@ -670,9 +699,9 @@ async def _finalize_tournament(reply_fn, context: ContextTypes.DEFAULT_TYPE):
         placements = list(players)
 
     num_players = len(players)
-    total_pot = buyin * num_players
-    structure = get_payout_structure(num_players)
-    payouts = {e["place"]: total_pot * e["percent"] / 100 for e in structure}
+    total_pot   = buyin * num_players
+    structure   = get_payout_structure(num_players, buyin, total_pot)
+    payouts     = {e["place"]: e["amount"] for e in structure}
 
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -682,11 +711,11 @@ async def _finalize_tournament(reply_fn, context: ContextTypes.DEFAULT_TYPE):
 
     place_emoji = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
     result_lines = []
-    winner_name = placements[0]
+    winner_name   = placements[0]
     winner_payout = payouts.get(1, 0.0)
 
     for i, name in enumerate(placements):
-        place = i + 1
+        place  = i + 1
         payout = payouts.get(place, 0.0)
         profit = payout - buyin
         c.execute("INSERT OR IGNORE INTO players (name) VALUES (?)", (name,))
@@ -705,27 +734,32 @@ async def _finalize_tournament(reply_fn, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     winner_profit = winner_payout - buyin
-    winner_roi = (winner_profit / buyin * 100) if buyin > 0 else 0
+    winner_roi    = (winner_profit / buyin * 100) if buyin > 0 else 0
 
-    await reply_fn(
+    # ── Quick summary for everyone ──
+    summary = (
         f"🏆 *TURNIER #{tournament_id} BEENDET!*\n\n"
         f"👑 *SIEGER: {winner_name}*\n"
         f"💰 Gewinn: *{winner_payout:.2f}€*  |  Buy-In: {buyin:.2f}€\n"
-        f"📈 ROI: *+{winner_roi:.0f}%*  |  Profit: *+{winner_profit:.2f}€*\n\n"
+        f"📈 ROI heute: *+{winner_roi:.0f}%*\n\n"
         f"📋 *Ergebnis:*\n" + "\n".join(result_lines) +
-        f"\n\n💵 Pot: {total_pot:.2f}€  |  {num_players} Spieler",
-        parse_mode="Markdown"
+        f"\n\n💵 Pot: {total_pot:.2f}€  |  {num_players} Spieler"
     )
+    await reply_fn(summary, parse_mode="Markdown")
 
+    # ── Profit chart for everyone ──
     chat_id = db_get("main_chat_id")
     if chat_id:
-        chart_path = _generate_profit_chart(placements, payouts, buyin, tournament_id)
-        if chart_path:
-            with open(chart_path, "rb") as f:
-                await context.bot.send_photo(chat_id=int(chat_id), photo=f,
-                                             caption=f"📊 Turnier #{tournament_id} — Profit/Verlust")
-            os.remove(chart_path)
+        chart = _generate_profit_chart(placements, payouts, buyin, tournament_id)
+        if chart:
+            with open(chart, "rb") as f:
+                await context.bot.send_photo(
+                    chat_id=int(chat_id), photo=f,
+                    caption=f"📊 Turnier #{tournament_id} — Profit/Verlust je Spieler"
+                )
+            os.remove(chart)
 
+    # ── Detailed per-player summaries for everyone ──
     await _send_player_summaries(context, placements, payouts, buyin, tournament_id)
     clear_session()
 
@@ -740,7 +774,7 @@ def _generate_profit_chart(placements, payouts, buyin, tournament_id) -> Optiona
     except ImportError:
         return None
     profits = [payouts.get(i + 1, 0.0) - buyin for i in range(len(placements))]
-    colors = ["#2ecc71" if p >= 0 else "#e74c3c" for p in profits]
+    colors  = ["#2ecc71" if p >= 0 else "#e74c3c" for p in profits]
     fig, ax = plt.subplots(figsize=(max(8, len(placements) * 1.3), 5))
     fig.patch.set_facecolor("#1a1a2e"); ax.set_facecolor("#16213e")
     bars = ax.bar(placements, profits, color=colors, edgecolor="#0f3460", linewidth=1.5, width=0.6)
@@ -751,8 +785,8 @@ def _generate_profit_chart(placements, payouts, buyin, tournament_id) -> Optiona
     ax.axhline(0, color="#aaaaaa", linewidth=0.8, linestyle="--")
     ax.set_title(f"🃏 Turnier #{tournament_id} — Profit/Verlust", color="#f0f0f0", fontsize=13, fontweight="bold")
     ax.set_ylabel("€", color="#aaaaaa"); ax.tick_params(colors="#cccccc")
-    for s in ["top", "right"]: ax.spines[s].set_visible(False)
-    for s in ["left", "bottom"]: ax.spines[s].set_color("#444466")
+    for s in ["top","right"]: ax.spines[s].set_visible(False)
+    for s in ["left","bottom"]: ax.spines[s].set_color("#444466")
     plt.xticks(rotation=20 if len(placements) > 5 else 0); plt.tight_layout()
     path = f"/tmp/poker_chart_{tournament_id}.png"
     plt.savefig(path, dpi=150, facecolor=fig.get_facecolor()); plt.close()
@@ -778,10 +812,10 @@ def _generate_player_chart(name: str, cum_data: list) -> Optional[str]:
     ax.set_title(f"📈 {name} — Kumulativer Profit", color="#f0f0f0", fontsize=13, fontweight="bold")
     ax.set_xlabel("Turnier #", color="#aaaaaa"); ax.set_ylabel("€", color="#aaaaaa")
     ax.tick_params(colors="#cccccc"); ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
-    for s in ["top", "right"]: ax.spines[s].set_visible(False)
-    for s in ["left", "bottom"]: ax.spines[s].set_color("#444466")
+    for s in ["top","right"]: ax.spines[s].set_visible(False)
+    for s in ["left","bottom"]: ax.spines[s].set_color("#444466")
     plt.tight_layout()
-    path = f"/tmp/poker_player_{name.replace(' ', '_')}.png"
+    path = f"/tmp/poker_player_{name.replace(' ','_')}.png"
     plt.savefig(path, dpi=150, facecolor=fig.get_facecolor()); plt.close()
     return path
 
@@ -791,33 +825,30 @@ async def _send_player_summaries(context, placements, payouts, buyin, tournament
     if not chat_id:
         return
     conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+    c    = conn.cursor()
     place_map = {1: "🥇", 2: "🥈", 3: "🥉"}
     for i, name in enumerate(placements):
-        place = i + 1
+        place  = i + 1
         payout = payouts.get(place, 0.0)
-        profit_this = payout - buyin
+        profit = payout - buyin
         c.execute("SELECT total_tournaments, total_wins, total_earnings, total_buyins FROM players WHERE name=?", (name,))
         row = c.fetchone()
         if not row:
             continue
         t, w, e, b = row
         total_profit = e - b
-        roi = (total_profit / b * 100) if b > 0 else 0
+        roi      = (total_profit / b * 100) if b > 0 else 0
         win_rate = (w / t * 100) if t > 0 else 0
-        emoji = place_map.get(place, f"#{place}")
-        profit_str = f"+{profit_this:.2f}€" if profit_this >= 0 else f"{profit_this:.2f}€"
-        total_str = f"+{total_profit:.2f}€" if total_profit >= 0 else f"{total_profit:.2f}€"
-        roi_str = f"+{roi:.0f}%" if roi >= 0 else f"{roi:.0f}%"
+        emoji    = place_map.get(place, f"#{place}")
         await context.bot.send_message(chat_id=int(chat_id), parse_mode="Markdown", text=(
             f"{emoji} *{name}* — Turnier #{tournament_id}\n"
             f"├ Platz {place} von {len(placements)}\n"
             f"├ Payout: {payout:.2f}€  (Buy-In: {buyin:.2f}€)\n"
-            f"└ Heute: *{profit_str}*\n\n"
+            f"└ Heute: *{'+'if profit>=0 else ''}{profit:.2f}€*\n\n"
             f"📊 *Gesamtbilanz:*\n"
             f"├ {t} Turniere  |  {w} Siege  ({win_rate:.0f}% WR)\n"
-            f"├ Profit: *{total_str}*\n"
-            f"└ ROI: *{roi_str}*"
+            f"├ Profit gesamt: *{'+'if total_profit>=0 else ''}{total_profit:.2f}€*\n"
+            f"└ ROI: *{'+'if roi>=0 else ''}{roi:.0f}%*"
         ))
         await asyncio.sleep(0.4)
     conn.close()
@@ -828,7 +859,7 @@ async def _send_player_summaries(context, placements, payouts, buyin, tournament
 # ─────────────────────────────────────────────
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+    c    = conn.cursor()
     c.execute("""SELECT name, total_tournaments, total_wins, total_earnings, total_buyins
                  FROM players WHERE total_tournaments>0
                  ORDER BY (total_earnings-total_buyins) DESC LIMIT 15""")
@@ -838,11 +869,11 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📊 Noch keine Daten.")
         return
     medals = ["🥇", "🥈", "🥉"]
-    lines = []
+    lines  = []
     for i, (name, t, w, e, b) in enumerate(rows):
         profit = e - b
-        roi = (profit / b * 100) if b > 0 else 0
-        medal = medals[i] if i < 3 else f"{i+1}."
+        roi    = (profit / b * 100) if b > 0 else 0
+        medal  = medals[i] if i < 3 else f"{i+1}."
         lines.append(f"{medal} *{name}*\n   🎮 {t}x  🏆 {w}x  💰 {'+'if profit>=0 else ''}{profit:.0f}€  📈 {'+'if roi>=0 else ''}{roi:.0f}%")
     await update.message.reply_text("📊 *Leaderboard*\n\n" + "\n\n".join(lines), parse_mode="Markdown")
 
@@ -853,7 +884,7 @@ async def player_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     name = " ".join(context.args).strip()
     conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+    c    = conn.cursor()
     c.execute("SELECT * FROM players WHERE name=?", (name,))
     player = c.fetchone()
     if not player:
@@ -861,8 +892,8 @@ async def player_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         return
     _, pname, _, t, w, e, b = player
-    profit = e - b
-    roi = (profit / b * 100) if b > 0 else 0
+    profit   = e - b
+    roi      = (profit / b * 100) if b > 0 else 0
     win_rate = (w / t * 100) if t > 0 else 0
     c.execute("""SELECT t.date, r.place, r.payout, t.buyin_amount
                  FROM results r JOIN tournaments t ON r.tournament_id=t.id
@@ -873,7 +904,7 @@ async def player_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     place_map = {1: "🥇", 2: "🥈", 3: "🥉"}
     for date, place, payout, bi in all_results:
         p = payout - bi; cum += p; cum_data.append(cum)
-        recent_lines.append(f"  {place_map.get(place, str(place)+'.') } {date[:10]} Platz {place}  {'+'if p>=0 else ''}{p:.0f}€")
+        recent_lines.append(f"  {place_map.get(place, str(place)+'.')} {date[:10]} Platz {place}  {'+'if p>=0 else ''}{p:.0f}€")
     profit_str = f"+{profit:.2f}€" if profit >= 0 else f"{profit:.2f}€"
     text = (
         f"👤 *{pname}*\n\n"
@@ -901,12 +932,12 @@ async def shotclock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_set("current_blind_level", "1")
     db_set("blind_start_time", datetime.now().isoformat())
     db_set("blind_running", "1")
-    level = get_active_blind_levels()[0]
+    level    = get_active_blind_levels()[0]
     end_time = (datetime.now() + timedelta(minutes=level["minutes"])).strftime("%H:%M")
     keyboard = [[
         InlineKeyboardButton("⏭ Nächstes Level", callback_data="next_level"),
         InlineKeyboardButton("⏹ Stoppen", callback_data="stop_blind"),
-    ], [
+    ],[
         InlineKeyboardButton("⏱ Zeit prüfen", callback_data="time_left"),
         InlineKeyboardButton("📋 Alle Level", callback_data="all_levels"),
     ]]
@@ -918,20 +949,17 @@ async def shotclock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def next_level_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _advance_level(update.message.reply_text)
-
-
-async def _advance_level(reply_fn):
-    levels = get_active_blind_levels()
+async def _advance_level(reply_fn: Callable):
+    levels  = get_active_blind_levels()
     current = int(db_get("current_blind_level") or "1")
-    nxt = current + 1
+    nxt     = current + 1
     if nxt > len(levels):
         await reply_fn("🏁 Letztes Blind-Level erreicht!")
         return
     db_set("current_blind_level", str(nxt))
     db_set("blind_start_time", datetime.now().isoformat())
-    level = levels[nxt - 1]; prev = levels[current - 1]
+    level    = levels[nxt - 1]
+    prev     = levels[current - 1]
     end_time = (datetime.now() + timedelta(minutes=level["minutes"])).strftime("%H:%M")
     keyboard = [[
         InlineKeyboardButton("⏭ Nächstes Level", callback_data="next_level"),
@@ -946,6 +974,10 @@ async def _advance_level(reply_fn):
     )
 
 
+async def next_level_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _advance_level(update.message.reply_text)
+
+
 async def stop_blind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_set("blind_running", "0")
     await update.message.reply_text("⏹ Blind-Timer gestoppt.")
@@ -955,13 +987,13 @@ async def blinds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if db_get("blind_running") != "1":
         await update.message.reply_text("⏹ Kein aktiver Timer. /shotclock zum Starten.")
         return
-    levels = get_active_blind_levels()
-    current = int(db_get("current_blind_level") or "1")
-    level = levels[current - 1]
-    elapsed = datetime.now() - datetime.fromisoformat(db_get("blind_start_time"))
+    levels   = get_active_blind_levels()
+    current  = int(db_get("current_blind_level") or "1")
+    level    = levels[current - 1]
+    elapsed  = datetime.now() - datetime.fromisoformat(db_get("blind_start_time"))
     remaining = max(timedelta(minutes=level["minutes"]) - elapsed, timedelta(0))
     mins, secs = divmod(int(remaining.total_seconds()), 60)
-    next_info = f"\n_Nächstes Level: {levels[current]['small']:,}/{levels[current]['big']:,}_" if current < len(levels) else ""
+    next_info = f"\n_Nächstes: {levels[current]['small']:,}/{levels[current]['big']:,}_" if current < len(levels) else ""
     keyboard = [[
         InlineKeyboardButton("⏭ Nächstes Level", callback_data="next_level"),
         InlineKeyboardButton("🔄 Aktualisieren", callback_data="time_left"),
@@ -973,9 +1005,13 @@ async def blinds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def blind_structure_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    levels = get_active_blind_levels()
+    levels  = get_active_blind_levels()
     current = int(db_get("current_blind_level") or "0")
-    lines = [f"Lvl {l['level']:2d} | {l['small']:>5,}/{l['big']:>6,} | {l['minutes']:2d}min" + (" ◀️" if l['level'] == current else "") for l in levels]
+    lines   = [
+        f"Lvl {l['level']:2d} | {l['small']:>5,}/{l['big']:>6,} | {l['minutes']:2d}min"
+        + (" ◀️" if l['level'] == current else "")
+        for l in levels
+    ]
     await update.message.reply_text("📋 *Blind-Struktur:*\n\n`" + "\n".join(lines) + "`", parse_mode="Markdown")
 
 
@@ -983,61 +1019,217 @@ async def blind_structure_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 #  STATUS
 # ─────────────────────────────────────────────
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    active = json.loads(db_get("active_players") or "[]")
-    busted = json.loads(db_get("busted_players") or "[]")
-    remaining = [p for p in active if p not in [b["name"] for b in busted]]
+    active   = json.loads(db_get("active_players") or "[]")
+    busted   = json.loads(db_get("busted_players") or "[]")
+    remaining = [p for p in active if p not in {b["name"] for b in busted}]
     buyin_str = db_get("buyin_amount")
-    current_blind = db_get("current_blind_level")
     blind_running = db_get("blind_running")
+    current_blind = db_get("current_blind_level")
     text = "📊 *Turnierstatus*\n\n"
     text += f"👥 Spieler: {len(active)} ({', '.join(active) if active else 'keine'})\n"
-    text += f"🃏 Noch im Spiel: {len(remaining)} ({', '.join(remaining) if remaining else '—'})\n"
+    text += f"🃏 Im Spiel: {len(remaining)} ({', '.join(remaining) if remaining else '—'})\n"
     if buyin_str:
         b = float(buyin_str)
         text += f"💶 Buy-In: {b:.0f}€  |  Pot: {b*len(active):.0f}€\n"
     if blind_running == "1" and current_blind:
         lvl = get_active_blind_levels()[int(current_blind) - 1]
-        text += f"⏱ Level {current_blind}: {lvl['small']:,}/{lvl['big']:,} (läuft)\n"
+        text += f"⏱ Level {current_blind}: {lvl['small']:,}/{lvl['big']:,} ▶️\n"
     else:
         text += "⏱ Blind-Timer: gestoppt\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
 # ─────────────────────────────────────────────
-#  ADMIN HISTORY & DELETE
+#  ADMIN PANEL
+# ─────────────────────────────────────────────
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update):
+        return
+    keyboard = [
+        [InlineKeyboardButton("👥 Admins verwalten", callback_data="adm_list_admins")],
+        [InlineKeyboardButton("🗑 Turnier löschen", callback_data="adm_del_tournament"),
+         InlineKeyboardButton("📥 Altes Turnier", callback_data="adm_add_history")],
+        [InlineKeyboardButton("💾 DB exportieren", callback_data="adm_export_db"),
+         InlineKeyboardButton("📤 DB importieren", callback_data="adm_import_db")],
+        [InlineKeyboardButton("🔄 Stats zurücksetzen", callback_data="adm_reset_stats")],
+        [InlineKeyboardButton("🧹 Session leeren", callback_data="adm_clear_session")],
+    ]
+    await update.message.reply_text(
+        "🔑 *Admin-Panel*", parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_superadmin(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Verwendung: `/addadmin 123456789 Username`", parse_mode="Markdown")
+        return
+    try:
+        uid   = int(context.args[0])
+        uname = context.args[1]
+    except ValueError:
+        await update.message.reply_text("❌ Ungültige ID.")
+        return
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("INSERT OR REPLACE INTO admins (user_id, username, role) VALUES (?,?,?)", (uid, uname, "admin"))
+    conn.commit(); conn.close()
+    await update.message.reply_text(f"✅ *{uname}* ({uid}) ist jetzt Admin!", parse_mode="Markdown")
+
+
+async def remove_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_superadmin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Verwendung: `/removeadmin 123456789`", parse_mode="Markdown")
+        return
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Ungültige ID.")
+        return
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("DELETE FROM admins WHERE user_id=?", (uid,))
+    conn.commit(); conn.close()
+    await update.message.reply_text(f"✅ Admin {uid} entfernt.")
+
+
+# ─────────────────────────────────────────────
+#  DB EXPORT / IMPORT
+# ─────────────────────────────────────────────
+async def export_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update):
+        return
+    if not os.path.exists(DB_FILE):
+        await update.message.reply_text("❌ Keine Datenbank gefunden.")
+        return
+    with open(DB_FILE, "rb") as f:
+        await update.message.reply_document(
+            document=f,
+            filename=f"poker_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db",
+            caption="💾 Datenbank-Backup"
+        )
+
+
+async def import_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage: Send a .db file to the chat with caption /importdb
+    Or: /importdb (then send file in next message)
+    """
+    if not await require_admin(update):
+        return
+
+    # Check if a document was attached to this message
+    if update.message.document:
+        await _process_db_import(update, context, update.message.document)
+        return
+
+    # No file attached — set waiting state and instruct user
+    db_set("waiting_for_db_import", str(update.effective_user.id))
+    await update.message.reply_text(
+        "📤 *Datenbank importieren*\n\n"
+        "Sende jetzt die `.db` Datei als Dateianhang in diesen Chat.\n\n"
+        "⚠️ *Achtung: Die aktuelle Datenbank wird überschrieben!*\n"
+        "_Ein Backup wird automatisch erstellt._",
+        parse_mode="Markdown"
+    )
+
+
+async def _process_db_import(update: Update, context: ContextTypes.DEFAULT_TYPE, document: Document):
+    if not await require_admin(update):
+        return
+    if not document.file_name or not document.file_name.endswith(".db"):
+        await update.message.reply_text("❌ Bitte eine `.db` Datei senden.")
+        return
+
+    await update.message.reply_text("⏳ Importiere Datenbank...")
+
+    # Backup current DB
+    if os.path.exists(DB_FILE):
+        backup_path = DB_FILE + f".backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        shutil.copy2(DB_FILE, backup_path)
+
+    # Download and replace
+    try:
+        file = await context.bot.get_file(document.file_id)
+        await file.download_to_drive(DB_FILE)
+        init_db()  # Ensure new tables exist if old DB was from earlier version
+        db_del("waiting_for_db_import")
+
+        # Quick sanity check
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM players")
+        player_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM tournaments")
+        tournament_count = c.fetchone()[0]
+        conn.close()
+
+        await update.message.reply_text(
+            f"✅ *Datenbank erfolgreich importiert!*\n\n"
+            f"👥 {player_count} Spieler\n"
+            f"🎮 {tournament_count} Turniere\n\n"
+            f"_Backup der alten DB wurde erstellt._",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Import fehlgeschlagen: {e}")
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming document files — check if DB import is pending."""
+    waiting_uid = db_get("waiting_for_db_import")
+    if waiting_uid and int(waiting_uid) == update.effective_user.id:
+        if update.message.document:
+            await _process_db_import(update, context, update.message.document)
+            return
+    # Save chat ID for all other messages
+    chat_id = str(update.effective_chat.id)
+    if db_get("main_chat_id") != chat_id:
+        db_set("main_chat_id", chat_id)
+
+
+# ─────────────────────────────────────────────
+#  HISTORY MANAGEMENT
 # ─────────────────────────────────────────────
 async def admin_add_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /addhistory DATUM BUYIN 1:Name 2:Name 3:Name ...
+    Example: /addhistory 2024-03-15 20 1:Dominik 2:Alex 3:Max 4:Jonas
+    """
     if not await require_admin(update):
         return
     if len(context.args) < 4:
         await update.message.reply_text(
             "📥 *Altes Turnier eintragen:*\n\n"
-            "`/addhistory DATUM BUYIN 1:Name 2:Name 3:Name ...`\n\n"
-            "Beispiel:\n`/addhistory 2024-03-15 20 1:Dominik 2:Alex 3:Max 4:Jonas`",
+            "`/addhistory DATUM BUYIN 1:Name 2:Name ...`\n\n"
+            "Beispiel:\n`/addhistory 2024-03-15 20 1:Dominik 2:Alex 3:Max 4:Jonas`\n\n"
+            "Datum-Format: JJJJ-MM-TT",
             parse_mode="Markdown"
         )
         return
     try:
         date_str = context.args[0]
-        buyin = float(context.args[1])
-        placements_raw = context.args[2:]
+        buyin    = float(context.args[1])
         placements: dict[int, str] = {}
-        for item in placements_raw:
+        for item in context.args[2:]:
             place_str, name = item.split(":", 1)
             placements[int(place_str)] = name
         num_players = len(placements)
-        total_pot = buyin * num_players
-        structure = get_payout_structure(num_players)
-        payouts = {e["place"]: total_pot * e["percent"] / 100 for e in structure}
+        total_pot   = buyin * num_players
+        structure   = get_payout_structure(num_players, buyin, total_pot)
+        payouts     = {e["place"]: e["amount"] for e in structure}
+
         conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
+        c    = conn.cursor()
         c.execute("INSERT INTO tournaments (date, num_players, buyin_amount, total_pot, chip_config, status) VALUES (?,?,?,?,?,?)",
                   (date_str + " 20:00:00", num_players, buyin, total_pot, "{}", "finished"))
         tournament_id = c.lastrowid
-        place_emoji = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"]
+        place_emoji   = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"]
         lines = []
         for place in sorted(placements.keys()):
-            name = placements[place]
+            name   = placements[place]
             payout = payouts.get(place, 0.0)
             c.execute("INSERT OR IGNORE INTO players (name) VALUES (?)", (name,))
             c.execute("INSERT INTO results (tournament_id, player_name, place, payout) VALUES (?,?,?,?)",
@@ -1045,15 +1237,16 @@ async def admin_add_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c.execute("""UPDATE players SET total_tournaments=total_tournaments+1, total_wins=total_wins+?,
                 total_earnings=total_earnings+?, total_buyins=total_buyins+? WHERE name=?""",
                       (1 if place == 1 else 0, payout, buyin, name))
-            emoji = place_emoji[place - 1] if place <= len(place_emoji) else f"{place}."
+            emoji  = place_emoji[place - 1] if place <= len(place_emoji) else f"{place}."
             profit = payout - buyin
             lines.append(f"{emoji} {name} — {payout:.2f}€ ({'+'if profit>=0 else ''}{profit:.2f}€)")
-        conn.commit()
-        conn.close()
+        conn.commit(); conn.close()
         await update.message.reply_text(
-            f"✅ *Turnier #{tournament_id} eingetragen ({date_str})*\n\n" + "\n".join(lines), parse_mode="Markdown")
+            f"✅ *Turnier #{tournament_id} eingetragen ({date_str})*\n\n" + "\n".join(lines),
+            parse_mode="Markdown"
+        )
     except Exception as e:
-        await update.message.reply_text(f"❌ Fehler: {e}")
+        await update.message.reply_text(f"❌ Fehler: {e}\nFormat prüfen!")
 
 
 async def admin_delete_tournament(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1061,12 +1254,12 @@ async def admin_delete_tournament(update: Update, context: ContextTypes.DEFAULT_
         return
     if not context.args:
         conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
+        c    = conn.cursor()
         c.execute("SELECT id, date, num_players, buyin_amount FROM tournaments ORDER BY id DESC LIMIT 10")
         rows = c.fetchall()
         conn.close()
         if not rows:
-            await update.message.reply_text("Keine Turniere vorhanden.")
+            await update.message.reply_text("Keine Turniere.")
             return
         lines = [f"  #{t_id} | {date[:10]} | {np} Spieler | {bi:.0f}€" for t_id, date, np, bi in rows]
         await update.message.reply_text(
@@ -1079,11 +1272,11 @@ async def admin_delete_tournament(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("❌ Ungültige ID.")
         return
     conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+    c    = conn.cursor()
     c.execute("SELECT buyin_amount FROM tournaments WHERE id=?", (t_id,))
     row = c.fetchone()
     if not row:
-        await update.message.reply_text(f"❌ Turnier #{t_id} nicht gefunden.")
+        await update.message.reply_text(f"❌ #{t_id} nicht gefunden.")
         conn.close()
         return
     buyin = row[0]
@@ -1094,9 +1287,8 @@ async def admin_delete_tournament(update: Update, context: ContextTypes.DEFAULT_
                   (1 if place == 1 else 0, payout, buyin, name))
     c.execute("DELETE FROM results WHERE tournament_id=?", (t_id,))
     c.execute("DELETE FROM tournaments WHERE id=?", (t_id,))
-    conn.commit()
-    conn.close()
-    await update.message.reply_text(f"✅ Turnier #{t_id} gelöscht. Statistiken korrigiert.")
+    conn.commit(); conn.close()
+    await update.message.reply_text(f"✅ Turnier #{t_id} gelöscht + Statistiken korrigiert.")
 
 
 async def admin_reset_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1107,8 +1299,9 @@ async def admin_reset_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("❌ Abbrechen", callback_data="cancel_reset"),
     ]]
     await update.message.reply_text(
-        "⚠️ *Alle Statistiken löschen?*\nKann nicht rückgängig gemacht werden!",
-        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        "⚠️ *Alle Statistiken löschen?*", parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 
 # ─────────────────────────────────────────────
@@ -1118,19 +1311,19 @@ async def check_blind_timer(context: ContextTypes.DEFAULT_TYPE):
     if db_get("blind_running") != "1":
         return
     current_str = db_get("current_blind_level")
-    start_str = db_get("blind_start_time")
+    start_str   = db_get("blind_start_time")
     if not current_str or not start_str:
         return
-    levels = get_active_blind_levels()
+    levels  = get_active_blind_levels()
     current = int(current_str)
     if current > len(levels):
         return
-    level = levels[current - 1]
+    level   = levels[current - 1]
     elapsed = datetime.now() - datetime.fromisoformat(start_str)
-    level_dur = timedelta(minutes=level["minutes"])
+    dur     = timedelta(minutes=level["minutes"])
 
     warned = db_get(f"warned_{current}")
-    if elapsed >= level_dur - timedelta(minutes=2) and not warned:
+    if elapsed >= dur - timedelta(minutes=2) and not warned:
         db_set(f"warned_{current}", "1")
         chat_id = db_get("main_chat_id")
         if chat_id:
@@ -1141,14 +1334,14 @@ async def check_blind_timer(context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Level wechseln", callback_data="next_level")]])
             )
 
-    if elapsed >= level_dur:
+    if elapsed >= dur:
         nxt = current + 1
         if nxt <= len(levels):
             db_set("current_blind_level", str(nxt))
             db_set("blind_start_time", datetime.now().isoformat())
             db_del(f"warned_{current}")
             next_level = levels[nxt - 1]
-            chat_id = db_get("main_chat_id")
+            chat_id    = db_get("main_chat_id")
             if chat_id:
                 await context.bot.send_message(
                     chat_id=int(chat_id),
@@ -1169,7 +1362,7 @@ async def check_blind_timer(context: ContextTypes.DEFAULT_TYPE):
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
+    data  = query.data
 
     if data.startswith("bust_"):
         await _handle_bustout(query, data[5:], context)
@@ -1193,52 +1386,62 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "time_left":
-        levels = get_active_blind_levels()
-        current = int(db_get("current_blind_level") or "1")
-        level = levels[current - 1]
-        elapsed = datetime.now() - datetime.fromisoformat(db_get("blind_start_time") or datetime.now().isoformat())
+        levels   = get_active_blind_levels()
+        current  = int(db_get("current_blind_level") or "1")
+        level    = levels[current - 1]
+        start    = db_get("blind_start_time")
+        elapsed  = datetime.now() - datetime.fromisoformat(start) if start else timedelta(0)
         remaining = max(timedelta(minutes=level["minutes"]) - elapsed, timedelta(0))
         mins, secs = divmod(int(remaining.total_seconds()), 60)
-        keyboard = [[
-            InlineKeyboardButton("⏭ Nächstes Level", callback_data="next_level"),
-            InlineKeyboardButton("🔄 Aktualisieren", callback_data="time_left"),
-        ]]
         await query.edit_message_text(
             f"⏱ *Level {current}*\n\n🔵 {level['small']:,}  🔴 {level['big']:,}\n⏰ Verbleibend: *{mins}:{secs:02d}*",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⏭ Nächstes Level", callback_data="next_level"),
+                InlineKeyboardButton("🔄 Aktualisieren", callback_data="time_left"),
+            ]])
         )
         return
 
     if data == "all_levels":
-        levels = get_active_blind_levels()
+        levels  = get_active_blind_levels()
         current = int(db_get("current_blind_level") or "0")
-        lines = [f"Lvl {l['level']:2d} | {l['small']:>5,}/{l['big']:>6,} | {l['minutes']:2d}min" + (" ◀️" if l['level'] == current else "") for l in levels]
+        lines   = [f"Lvl {l['level']:2d} | {l['small']:>5,}/{l['big']:>6,} | {l['minutes']:2d}min" + (" ◀️" if l['level'] == current else "") for l in levels]
         await query.edit_message_text("📋 *Blind-Struktur:*\n\n`" + "\n".join(lines) + "`", parse_mode="Markdown")
         return
 
-    # ── Player Menu ──
+    # Player menu
     if data.startswith("ap_"):
         action = data[3:]
         if action == "done":
             active = json.loads(db_get("active_players") or "[]")
+            buyin_str = db_get("buyin_amount")
+            info = ""
+            if buyin_str and active:
+                buyin = float(buyin_str)
+                pot   = buyin * len(active)
+                structure = get_payout_structure(len(active), buyin, pot)
+                place_map = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+                payout_lines = [f"{place_map[e['place']-1]} Platz {e['place']}: {e['amount']:.2f}€" for e in structure]
+                info = f"\n\n💰 *Payouts ({len(active)} Spieler, {pot:.0f}€ Pot):*\n" + "\n".join(payout_lines)
             await query.edit_message_text(
-                f"✅ *{len(active)} Spieler:* {', '.join(active)}\n\nNächster Schritt: /chipset",
-                parse_mode="Markdown")
+                f"✅ *{len(active)} Spieler:* {', '.join(active)}" + info + "\n\nNächster Schritt: /chipset",
+                parse_mode="Markdown"
+            )
             return
         if action == "custom":
             await query.edit_message_text("✏️ Neuen Spieler: `/addplayer Name`", parse_mode="Markdown")
             return
         _toggle_player(action)
         active = json.loads(db_get("active_players") or "[]")
-        active_display = ", ".join(active) if active else "noch niemand"
         await query.edit_message_text(
-            f"👥 *Spieler auswählen*\n\nAktuell dabei: _{active_display}_",
+            f"👥 *Spieler auswählen*\n\nAktuell: _{', '.join(active) if active else 'niemand'}_",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(_build_player_keyboard(active))
         )
         return
 
-    # ── Chipset ──
+    # Chipset
     if data.startswith("chipset_"):
         key = data[8:]
         if key == "manual":
@@ -1250,19 +1453,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _show_chip_summary(lambda text, **kw: query.edit_message_text(text, **kw), chip_config)
         return
 
-    # ── Admin Callbacks ──
+    # Admin callbacks
     if data == "adm_clear_session":
         clear_session()
         await query.edit_message_text("🧹 Session geleert. /newgame für neues Turnier.")
         return
 
     if data == "adm_reset_stats":
-        keyboard = [[
-            InlineKeyboardButton("⚠️ JA, alles löschen", callback_data="confirm_reset_stats"),
-            InlineKeyboardButton("❌ Abbrechen", callback_data="cancel_reset"),
-        ]]
-        await query.edit_message_text("⚠️ *Alle Statistiken löschen?*", parse_mode="Markdown",
-                                      reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(
+            "⚠️ *Alle Statistiken löschen?*", parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⚠️ JA", callback_data="confirm_reset_stats"),
+                InlineKeyboardButton("❌ Abbrechen", callback_data="cancel_reset"),
+            ]])
+        )
         return
 
     if data == "confirm_reset_stats":
@@ -1272,9 +1476,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn = sqlite3.connect(DB_FILE)
         conn.execute("DELETE FROM results")
         conn.execute("DELETE FROM tournaments")
-        conn.execute("UPDATE players SET total_tournaments=0, total_wins=0, total_earnings=0, total_buyins=0")
-        conn.commit()
-        conn.close()
+        conn.execute("UPDATE players SET total_tournaments=0,total_wins=0,total_earnings=0,total_buyins=0")
+        conn.commit(); conn.close()
         await query.edit_message_text("✅ Alle Statistiken zurückgesetzt.")
         return
 
@@ -1283,32 +1486,52 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "adm_list_admins":
-        supers = [f"👑 Superadmin (ENV): {uid}" for uid in SUPERADMIN_IDS]
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT user_id, username, role FROM admins")
-        admins_db = [f"🔑 {un} ({uid})" for uid, un, _ in c.fetchall()]
+        supers    = [f"👑 Superadmin (ENV): {uid}" for uid in SUPERADMIN_IDS]
+        conn      = sqlite3.connect(DB_FILE)
+        c         = conn.cursor()
+        c.execute("SELECT user_id, username FROM admins")
+        db_admins = [f"🔑 {un} ({uid})" for uid, un in c.fetchall()]
         conn.close()
-        text = "*Admins:*\n\n" + "\n".join(supers + admins_db) if (supers or admins_db) else "Keine Admins."
+        text = "*Admins:*\n\n" + "\n".join(supers + db_admins) if (supers or db_admins) else "Keine Admins."
         text += "\n\nHinzufügen: `/addadmin USER_ID Name`"
         await query.edit_message_text(text, parse_mode="Markdown")
         return
 
     if data == "adm_add_history":
         await query.edit_message_text(
-            "📥 `/addhistory 2024-03-15 20 1:Dominik 2:Alex 3:Max`", parse_mode="Markdown")
+            "📥 `/addhistory 2024-03-15 20 1:Dominik 2:Alex 3:Max`\n\nFormat: Datum BuyIn 1:Name 2:Name ...",
+            parse_mode="Markdown"
+        )
         return
 
     if data == "adm_del_tournament":
         await query.edit_message_text(
             "🗑 `/deletetournament` — zeigt Liste\n`/deletetournament ID` — löscht Turnier",
-            parse_mode="Markdown")
+            parse_mode="Markdown"
+        )
         return
 
-    if data == "adm_edit_tournament":
+    if data == "adm_export_db":
+        if not os.path.exists(DB_FILE):
+            await query.edit_message_text("❌ Keine Datenbank gefunden.")
+            return
+        await query.edit_message_text("💾 Datenbank wird gesendet...")
+        with open(DB_FILE, "rb") as f:
+            await context.bot.send_document(
+                chat_id=query.message.chat_id,
+                document=f,
+                filename=f"poker_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db",
+                caption="💾 Datenbank-Backup"
+            )
+        return
+
+    if data == "adm_import_db":
+        db_set("waiting_for_db_import", str(query.from_user.id))
         await query.edit_message_text(
-            "✏️ Löschen + neu eintragen:\n1. `/deletetournament ID`\n2. `/addhistory ...`",
-            parse_mode="Markdown")
+            "📤 *DB importieren*\n\nSende jetzt die `.db` Datei als Anhang.\n\n"
+            "⚠️ Aktuelle DB wird überschrieben (Backup wird erstellt).",
+            parse_mode="Markdown"
+        )
         return
 
 
@@ -1329,47 +1552,61 @@ def main():
         print("❌ BOT_TOKEN fehlt! Railway → Variables → BOT_TOKEN=...")
         return
     if not SUPERADMIN_IDS:
-        print("⚠️  SUPERADMIN_IDS nicht gesetzt. Railway → Variables → SUPERADMIN_IDS=deine_telegram_id")
-        print("   Deine Telegram-ID findest du mit @userinfobot")
+        print("⚠️  SUPERADMIN_IDS nicht gesetzt!")
+        print("   Railway → Variables → SUPERADMIN_IDS=deine_telegram_id")
+        print("   Deine ID: schreib @userinfobot auf Telegram")
 
     logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
     init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("newgame", new_game))
-    app.add_handler(CommandHandler("addplayer", add_player_cmd))
-    app.add_handler(CommandHandler("removeplayer", remove_player))
-    app.add_handler(CommandHandler("players", list_players))
-    app.add_handler(CommandHandler("chipset", chipset_cmd))
-    app.add_handler(CommandHandler("setchips", set_chips))
-    app.add_handler(CommandHandler("calculate", calculate))
-    app.add_handler(CommandHandler("payout", payout_cmd))
-    app.add_handler(CommandHandler("bustout", bustout_cmd))
-    app.add_handler(CommandHandler("endtournament", end_tournament))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("playerstats", player_stats))
-    app.add_handler(CommandHandler("shotclock", shotclock_cmd))
-    app.add_handler(CommandHandler("nextlevel", next_level_cmd))
-    app.add_handler(CommandHandler("stopblind", stop_blind_cmd))
-    app.add_handler(CommandHandler("blinds", blinds_cmd))
-    app.add_handler(CommandHandler("blindstructure", blind_structure_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("adminpanel", admin_panel))
-    app.add_handler(CommandHandler("addadmin", add_admin_cmd))
-    app.add_handler(CommandHandler("removeadmin", remove_admin_cmd))
-    app.add_handler(CommandHandler("addhistory", admin_add_history))
-    app.add_handler(CommandHandler("deletetournament", admin_delete_tournament))
-    app.add_handler(CommandHandler("resetstats", admin_reset_stats))
+    # Tournament
+    app.add_handler(CommandHandler("start",           start))
+    app.add_handler(CommandHandler("help",            help_cmd))
+    app.add_handler(CommandHandler("newgame",         new_game))
+    app.add_handler(CommandHandler("addplayer",       add_player_cmd))
+    app.add_handler(CommandHandler("removeplayer",    remove_player))
+    app.add_handler(CommandHandler("players",         list_players))
+    app.add_handler(CommandHandler("chipset",         chipset_cmd))
+    app.add_handler(CommandHandler("setchips",        set_chips))
+    app.add_handler(CommandHandler("calculate",       calculate))
+    app.add_handler(CommandHandler("payout",          payout_cmd))
+    app.add_handler(CommandHandler("bustout",         bustout_cmd))
+    app.add_handler(CommandHandler("endtournament",   end_tournament))
+    # Stats
+    app.add_handler(CommandHandler("stats",           stats_cmd))
+    app.add_handler(CommandHandler("playerstats",     player_stats))
+    app.add_handler(CommandHandler("status",          status_cmd))
+    # Blind clock
+    app.add_handler(CommandHandler("shotclock",       shotclock_cmd))
+    app.add_handler(CommandHandler("nextlevel",       next_level_cmd))
+    app.add_handler(CommandHandler("stopblind",       stop_blind_cmd))
+    app.add_handler(CommandHandler("blinds",          blinds_cmd))
+    app.add_handler(CommandHandler("blindstructure",  blind_structure_cmd))
+    # Admin
+    app.add_handler(CommandHandler("adminpanel",      admin_panel))
+    app.add_handler(CommandHandler("addadmin",        add_admin_cmd))
+    app.add_handler(CommandHandler("removeadmin",     remove_admin_cmd))
+    app.add_handler(CommandHandler("addhistory",      admin_add_history))
+    app.add_handler(CommandHandler("deletetournament",admin_delete_tournament))
+    app.add_handler(CommandHandler("resetstats",      admin_reset_stats))
+    app.add_handler(CommandHandler("exportdb",        export_db_cmd))
+    app.add_handler(CommandHandler("importdb",        import_db_cmd))
+    # Info
+    app.add_handler(CommandHandler("changelog",       changelog_cmd))
 
+    # Callbacks
     app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.ALL, save_chat_id))
 
+    # Documents (for DB import) + chat ID saving
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.Document.ALL, save_chat_id))
+
+    # Background job
     app.job_queue.run_repeating(check_blind_timer, interval=30, first=10)
 
-    print("🃏 CDVPoker Bot v3.0 gestartet!")
+    print("🃏 CDVPoker Bot v4.0 gestartet!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
