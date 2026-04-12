@@ -47,6 +47,18 @@ SUPERADMIN_IDS: set[int] = {int(x.strip()) for x in _raw_ids.split(",") if x.str
 # ─────────────────────────────────────────────
 CHANGELOG = [
     {
+        "version": "v5.0",
+        "date": "2026-04",
+        "changes": [
+            "🆕 /seatdraw — Zufällige Sitzplatz-Ziehung mit Animation",
+            "🆕 Streak-Tracking — Win/Loss Streaks in Spieler-Stats",
+            "🆕 Bounty-Modus — /newgame 20 3h bounty:5 für Kopfgelder",
+            "🆕 /history — Turnier-Archiv mit allen vergangenen Spielen",
+            "🆕 Auto-Backup — täglich um Mitternacht per Telegram",
+            "🔧 Heads-Up Anzeige wenn nur noch 2 Spieler übrig",
+        ],
+    },
+    {
         "version": "v4.0",
         "date": "2025-04",
         "changes": [
@@ -209,8 +221,17 @@ def init_db():
         total_tournaments INTEGER DEFAULT 0,
         total_wins INTEGER DEFAULT 0,
         total_earnings REAL DEFAULT 0,
-        total_buyins REAL DEFAULT 0
+        total_buyins REAL DEFAULT 0,
+        current_streak INTEGER DEFAULT 0,
+        best_streak INTEGER DEFAULT 0,
+        worst_streak INTEGER DEFAULT 0
     )""")
+    # Add streak columns to existing DBs (migration)
+    for col, default in [("current_streak","0"),("best_streak","0"),("worst_streak","0")]:
+        try:
+            c.execute(f"ALTER TABLE players ADD COLUMN {col} INTEGER DEFAULT {default}")
+        except Exception:
+            pass
     c.execute("""CREATE TABLE IF NOT EXISTS tournaments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         date TEXT DEFAULT (datetime('now')),
@@ -219,16 +240,28 @@ def init_db():
         total_pot REAL,
         chip_config TEXT DEFAULT '{}',
         status TEXT DEFAULT 'setup',
-        notes TEXT DEFAULT ''
+        notes TEXT DEFAULT '',
+        bounty_amount REAL DEFAULT 0
     )""")
+    try:
+        c.execute("ALTER TABLE tournaments ADD COLUMN bounty_amount REAL DEFAULT 0")
+    except Exception:
+        pass
     c.execute("""CREATE TABLE IF NOT EXISTS results (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tournament_id INTEGER,
         player_name TEXT,
         place INTEGER,
         payout REAL,
+        bounties_won INTEGER DEFAULT 0,
+        bounty_payout REAL DEFAULT 0,
         FOREIGN KEY (tournament_id) REFERENCES tournaments(id)
     )""")
+    for col, typ, default in [("bounties_won","INTEGER","0"),("bounty_payout","REAL","0")]:
+        try:
+            c.execute(f"ALTER TABLE results ADD COLUMN {col} {typ} DEFAULT {default}")
+        except Exception:
+            pass
     c.execute("""CREATE TABLE IF NOT EXISTS admins (
         user_id INTEGER PRIMARY KEY,
         username TEXT,
@@ -271,7 +304,8 @@ def db_del(key: str):
 def clear_session():
     for key in ["active_players", "buyin_amount", "chip_config",
                 "current_blind_level", "blind_start_time", "blind_running",
-                "busted_players", "blind_levels", "tournament_duration"]:
+                "busted_players", "blind_levels", "tournament_duration",
+                "bounty_amount", "bounty_kills"]:
         db_del(key)
 
 
@@ -328,10 +362,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     mark = " 👑" if is_superadmin(uid) else (" 🔑" if is_admin(uid) else "")
     text = (
-        f"🃏 *CDVPoker Bot v4.0{mark}*\n\n"
+        f"🃏 *CDVPoker Bot v5.0{mark}*\n\n"
         "🎮 *Turnier*\n"
-        "`/newgame 20 3h` — Turnier starten (Buy-In, Dauer)\n"
+        "`/newgame 20 3h` — Turnier starten\n"
+        "`/newgame 20 3h bounty:5` — Mit Bounty-Modus 💀\n"
         "`/addplayer` — Spieler wählen (Buttons)\n"
+        "`/seatdraw` — Zufällige Sitzplätze 🎲\n"
         "`/chipset` — Chip-Set wählen\n"
         "`/calculate` — Chip-Verteilung\n"
         "`/payout` — Payouts anzeigen\n"
@@ -343,7 +379,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/nextlevel` `/stopblind` `/blindstructure`\n\n"
         "📊 *Statistik*\n"
         "`/stats` — Leaderboard\n"
-        "`/playerstats [Name]` — Stats + Grafik\n"
+        "`/playerstats [Name]` — Stats + Streaks + Grafik\n"
+        "`/history` — Turnier-Archiv\n"
         "`/status` — Turnierstatus\n\n"
         "🔑 *Admin*\n"
         "`/adminpanel` — Admin-Funktionen\n\n"
@@ -379,15 +416,27 @@ async def new_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     clear_session()
 
-    # Usage: /newgame BUYIN DURATION
+    # Usage: /newgame BUYIN DURATION [bounty:AMOUNT]
     # e.g.   /newgame 20 3h
+    #        /newgame 20 3h bounty:5
     if len(context.args) >= 2:
         try:
-            buyin = float(context.args[0])
-            dur_str = context.args[1].lower().replace("h", "").replace("std", "")
+            buyin    = float(context.args[0])
+            dur_str  = context.args[1].lower().replace("h", "").replace("std", "")
             total_minutes = int(float(dur_str) * 60)
+
+            # Check for bounty parameter
+            bounty = 0.0
+            for arg in context.args[2:]:
+                if arg.lower().startswith("bounty:"):
+                    bounty = float(arg.split(":")[1])
+
             db_set("buyin_amount", str(buyin))
             db_set("tournament_duration", str(total_minutes))
+            if bounty > 0:
+                db_set("bounty_amount", str(bounty))
+                db_set("bounty_kills", "{}")  # {killer: count}
+
             levels = build_blind_levels(total_minutes)
             db_set("blind_levels", json.dumps(levels))
 
@@ -398,15 +447,18 @@ async def new_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
             blind_preview.append(f"  ... ({len(levels)} Level, {sum(l['minutes'] for l in levels)} min)")
 
+            bounty_info = f"\n💀 *Bounty-Modus: {bounty:.0f}€ pro Eliminierung!*" if bounty > 0 else ""
+
             await update.message.reply_text(
                 f"🎰 *Turnier eingerichtet!*\n\n"
-                f"💶 Buy-In: *{buyin:.0f}€*\n"
-                f"⏱ Geplante Dauer: *{total_minutes//60}h{total_minutes%60:02d}m*\n\n"
+                f"💶 Buy-In: *{buyin:.0f}€*"
+                + (f" + {bounty:.0f}€ Bounty" if bounty > 0 else "") +
+                f"\n⏱ Geplante Dauer: *{total_minutes//60}h{total_minutes%60:02d}m*"
+                + bounty_info + "\n\n"
                 f"🎯 *Blind-Vorschau:*\n" + "\n".join(blind_preview) + "\n\n"
                 f"📋 *Nächste Schritte:*\n"
                 f"1️⃣ /addplayer — Spieler wählen\n"
                 f"2️⃣ /chipset — Chip-Set wählen\n"
-                f"   _(Payouts & Chips werden nach Spielerwahl berechnet)_\n"
                 f"3️⃣ /shotclock — Timer starten\n"
                 f"4️⃣ /bustout — Bustouts eintragen",
                 parse_mode="Markdown"
@@ -417,9 +469,12 @@ async def new_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "🎰 *Neues Turnier*\n\n"
-        "`/newgame [Buy-In €] [Dauer]`\n\n"
+        "`/newgame [Buy-In €] [Dauer]`\n"
+        "`/newgame [Buy-In €] [Dauer] bounty:[€]`\n\n"
         "Beispiele:\n"
-        "`/newgame 20 3h`\n`/newgame 15 2.5h`\n`/newgame 25 4h`\n\n"
+        "`/newgame 20 3h`\n"
+        "`/newgame 20 3h bounty:5`\n"
+        "`/newgame 25 4h bounty:10`\n\n"
         "_Spieleranzahl wird automatisch aus /addplayer berechnet!_",
         parse_mode="Markdown"
     )
@@ -640,8 +695,8 @@ async def _send_bustout_menu(reply_fn: Callable, edit_fn: Optional[Callable] = N
 
 
 async def _handle_bustout(query, name: str, context: ContextTypes.DEFAULT_TYPE):
-    players = json.loads(db_get("active_players") or "[]")
-    busted = json.loads(db_get("busted_players") or "[]")
+    players      = json.loads(db_get("active_players") or "[]")
+    busted       = json.loads(db_get("busted_players") or "[]")
     busted_names = {b["name"] for b in busted}
     if name not in players:
         await query.answer(f"❌ {name} ist kein aktiver Spieler!")
@@ -650,11 +705,32 @@ async def _handle_bustout(query, name: str, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"⚠️ {name} bereits ausgeschieden!")
         return
     remaining = [p for p in players if p not in busted_names]
-    place = len(remaining)
+    place     = len(remaining)
     busted.append({"name": name, "place": place})
     db_set("busted_players", json.dumps(busted))
     await query.answer(f"💀 {name} — Platz {place}")
     remaining_after = [p for p in players if p not in {b["name"] for b in busted}]
+
+    # Bounty: ask who made the kill
+    bounty_str = db_get("bounty_amount")
+    if bounty_str and float(bounty_str) > 0 and remaining_after:
+        bounty = float(bounty_str)
+        kb = [
+            [InlineKeyboardButton(
+                f"🎯 {p} hat {name} eliminiert (+{bounty:.0f}€)",
+                callback_data=f"bounty_{p}_{name}"
+            )]
+            for p in remaining_after
+        ]
+        kb.append([InlineKeyboardButton("⏭ Überspringen", callback_data=f"bounty_skip_{name}")])
+        await query.edit_message_text(
+            f"💀 *{name}* — Platz {place}!\n\n💀 Wer hat *{name}* eliminiert? (+{bounty:.0f}€ Bounty)",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+        return
+
+    # Winner?
     if len(remaining_after) == 1:
         winner = remaining_after[0]
         busted.append({"name": winner, "place": 1})
@@ -665,6 +741,17 @@ async def _handle_bustout(query, name: str, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏁 Auswertung starten", callback_data="finish_tournament")]])
         )
         return
+
+    # Heads-Up announcement
+    if len(remaining_after) == 2:
+        chat_id = db_get("main_chat_id")
+        if chat_id:
+            await context.bot.send_message(
+                chat_id=int(chat_id),
+                text=f"🤜🤛 *HEADS-UP!*\n\n⚔️ *{remaining_after[0]}* vs *{remaining_after[1]}*\n\n_Möge der Bessere gewinnen!_ 🃏",
+                parse_mode="Markdown"
+            )
+
     await _send_bustout_menu(None, edit_fn=query.edit_message_text)
 
 
@@ -680,9 +767,11 @@ async def end_tournament(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _finalize_tournament(reply_fn: Callable, context: ContextTypes.DEFAULT_TYPE):
     db_set("blind_running", "0")
 
-    players = json.loads(db_get("active_players") or "[]")
-    busted  = json.loads(db_get("busted_players") or "[]")
-    buyin   = float(db_get("buyin_amount") or "0")
+    players     = json.loads(db_get("active_players") or "[]")
+    busted      = json.loads(db_get("busted_players") or "[]")
+    buyin       = float(db_get("buyin_amount") or "0")
+    bounty      = float(db_get("bounty_amount") or "0")
+    bounty_kills = json.loads(db_get("bounty_kills") or "{}")  # {killer: count}
 
     if not players:
         await reply_fn("❌ Keine aktiven Spieler.")
@@ -690,7 +779,7 @@ async def _finalize_tournament(reply_fn: Callable, context: ContextTypes.DEFAULT
 
     # Build placement order
     if busted:
-        ordered = sorted(busted, key=lambda x: x["place"])
+        ordered    = sorted(busted, key=lambda x: x["place"])
         placements = [b["name"] for b in ordered]
         for p in players:
             if p not in placements:
@@ -704,53 +793,97 @@ async def _finalize_tournament(reply_fn: Callable, context: ContextTypes.DEFAULT
     payouts     = {e["place"]: e["amount"] for e in structure}
 
     conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("INSERT INTO tournaments (num_players, buyin_amount, total_pot, chip_config, status) VALUES (?,?,?,?,?)",
-              (num_players, buyin, total_pot, db_get("chip_config") or "{}", "finished"))
+    c    = conn.cursor()
+    c.execute("INSERT INTO tournaments (num_players, buyin_amount, total_pot, chip_config, status, bounty_amount) VALUES (?,?,?,?,?,?)",
+              (num_players, buyin, total_pot, db_get("chip_config") or "{}", "finished", bounty))
     tournament_id = c.lastrowid
 
-    place_emoji = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    place_emoji  = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
     result_lines = []
     winner_name   = placements[0]
     winner_payout = payouts.get(1, 0.0)
 
     for i, name in enumerate(placements):
-        place  = i + 1
-        payout = payouts.get(place, 0.0)
-        profit = payout - buyin
+        place           = i + 1
+        payout          = payouts.get(place, 0.0)
+        kills           = bounty_kills.get(name, 0)
+        bounty_earned   = kills * bounty
+        total_payout    = payout + bounty_earned
+        profit          = total_payout - buyin - (bounty if bounty > 0 else 0)
+
         c.execute("INSERT OR IGNORE INTO players (name) VALUES (?)", (name,))
-        c.execute("INSERT INTO results (tournament_id, player_name, place, payout) VALUES (?,?,?,?)",
-                  (tournament_id, name, place, payout))
-        c.execute("""UPDATE players SET total_tournaments=total_tournaments+1,
-            total_wins=total_wins+?, total_earnings=total_earnings+?, total_buyins=total_buyins+?
-            WHERE name=?""", (1 if place == 1 else 0, payout, buyin, name))
-        emoji = place_emoji[i] if i < len(place_emoji) else f"{place}."
-        if payout > 0:
-            result_lines.append(f"{emoji} *{name}* — {payout:.2f}€ ({'+'if profit>=0 else ''}{profit:.2f}€)")
+        c.execute("""INSERT INTO results
+            (tournament_id, player_name, place, payout, bounties_won, bounty_payout)
+            VALUES (?,?,?,?,?,?)""",
+                  (tournament_id, name, place, payout, kills, bounty_earned))
+
+        # Update player stats + streak
+        won = 1 if place == 1 else 0
+        c.execute("SELECT current_streak, best_streak, worst_streak FROM players WHERE name=?", (name,))
+        streak_row = c.fetchone()
+        cur_streak = streak_row[0] if streak_row else 0
+        best       = streak_row[1] if streak_row else 0
+        worst      = streak_row[2] if streak_row else 0
+
+        if won:
+            new_streak = cur_streak + 1 if cur_streak >= 0 else 1
         else:
-            result_lines.append(f"{emoji} {name} — -{buyin:.2f}€")
+            new_streak = cur_streak - 1 if cur_streak <= 0 else -1
+
+        new_best  = max(best, new_streak)
+        new_worst = min(worst, new_streak)
+
+        c.execute("""UPDATE players SET
+            total_tournaments=total_tournaments+1,
+            total_wins=total_wins+?,
+            total_earnings=total_earnings+?,
+            total_buyins=total_buyins+?,
+            current_streak=?,
+            best_streak=?,
+            worst_streak=?
+            WHERE name=?""",
+                  (won, total_payout, buyin + (bounty if bounty > 0 else 0),
+                   new_streak, new_best, new_worst, name))
+
+        emoji = place_emoji[i] if i < len(place_emoji) else f"{place}."
+        line  = f"{emoji} *{name}* — {payout:.2f}€"
+        if bounty_earned > 0:
+            line += f" + {bounty_earned:.0f}€ Bounty ({kills}x 💀)"
+        profit_val = payout + bounty_earned - buyin - (bounty if bounty > 0 else 0)
+        line += f" ({'+'if profit_val>=0 else ''}{profit_val:.2f}€)"
+        result_lines.append(line)
+
+        # Streak badge
+        if new_streak >= 3:
+            result_lines[-1] += f" 🔥{new_streak}"
+        elif new_streak <= -3:
+            result_lines[-1] += f" 🥶{abs(new_streak)}"
 
     conn.commit()
     conn.close()
 
-    winner_profit = winner_payout - buyin
-    winner_roi    = (winner_profit / buyin * 100) if buyin > 0 else 0
+    winner_bounty = bounty_kills.get(winner_name, 0) * bounty
+    winner_profit = winner_payout + winner_bounty - buyin - (bounty if bounty > 0 else 0)
+    winner_roi    = (winner_profit / (buyin + bounty) * 100) if (buyin + bounty) > 0 else 0
 
-    # ── Quick summary for everyone ──
+    bounty_line = f"💀 Bounty-Modus: {bounty:.0f}€ pro Kill\n" if bounty > 0 else ""
+
     summary = (
         f"🏆 *TURNIER #{tournament_id} BEENDET!*\n\n"
         f"👑 *SIEGER: {winner_name}*\n"
-        f"💰 Gewinn: *{winner_payout:.2f}€*  |  Buy-In: {buyin:.2f}€\n"
+        f"💰 Gewinn: *{winner_payout:.2f}€*"
+        + (f" + {winner_bounty:.0f}€ Bounties" if winner_bounty > 0 else "") +
+        f"  |  Buy-In: {buyin:.2f}€\n"
         f"📈 ROI heute: *+{winner_roi:.0f}%*\n\n"
+        + bounty_line +
         f"📋 *Ergebnis:*\n" + "\n".join(result_lines) +
         f"\n\n💵 Pot: {total_pot:.2f}€  |  {num_players} Spieler"
     )
     await reply_fn(summary, parse_mode="Markdown")
 
-    # ── Profit chart for everyone ──
     chat_id = db_get("main_chat_id")
     if chat_id:
-        chart = _generate_profit_chart(placements, payouts, buyin, tournament_id)
+        chart = _generate_profit_chart(placements, payouts, buyin, tournament_id, bounty_kills, bounty)
         if chart:
             with open(chart, "rb") as f:
                 await context.bot.send_photo(
@@ -759,21 +892,23 @@ async def _finalize_tournament(reply_fn: Callable, context: ContextTypes.DEFAULT
                 )
             os.remove(chart)
 
-    # ── Detailed per-player summaries for everyone ──
-    await _send_player_summaries(context, placements, payouts, buyin, tournament_id)
+    await _send_player_summaries(context, placements, payouts, buyin, tournament_id, bounty_kills, bounty)
     clear_session()
 
 
 # ─────────────────────────────────────────────
 #  CHARTS
 # ─────────────────────────────────────────────
-def _generate_profit_chart(placements, payouts, buyin, tournament_id) -> Optional[str]:
+def _generate_profit_chart(placements, payouts, buyin, tournament_id, bounty_kills=None, bounty=0.0) -> Optional[str]:
     try:
         import matplotlib; matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
         return None
-    profits = [payouts.get(i + 1, 0.0) - buyin for i in range(len(placements))]
+    if bounty_kills is None:
+        bounty_kills = {}
+    profits = [payouts.get(i+1,0.0) + bounty_kills.get(n,0)*bounty - buyin - (bounty if bounty>0 else 0)
+               for i, n in enumerate(placements)]
     colors  = ["#2ecc71" if p >= 0 else "#e74c3c" for p in profits]
     fig, ax = plt.subplots(figsize=(max(8, len(placements) * 1.3), 5))
     fig.patch.set_facecolor("#1a1a2e"); ax.set_facecolor("#16213e")
@@ -820,7 +955,9 @@ def _generate_player_chart(name: str, cum_data: list) -> Optional[str]:
     return path
 
 
-async def _send_player_summaries(context, placements, payouts, buyin, tournament_id):
+async def _send_player_summaries(context, placements, payouts, buyin, tournament_id, bounty_kills=None, bounty=0.0):
+    if bounty_kills is None:
+        bounty_kills = {}
     chat_id = db_get("main_chat_id")
     if not chat_id:
         return
@@ -828,27 +965,42 @@ async def _send_player_summaries(context, placements, payouts, buyin, tournament
     c    = conn.cursor()
     place_map = {1: "🥇", 2: "🥈", 3: "🥉"}
     for i, name in enumerate(placements):
-        place  = i + 1
-        payout = payouts.get(place, 0.0)
-        profit = payout - buyin
-        c.execute("SELECT total_tournaments, total_wins, total_earnings, total_buyins FROM players WHERE name=?", (name,))
+        place         = i + 1
+        payout        = payouts.get(place, 0.0)
+        kills         = bounty_kills.get(name, 0)
+        bounty_earned = kills * bounty
+        profit        = payout + bounty_earned - buyin - (bounty if bounty > 0 else 0)
+        c.execute("SELECT total_tournaments, total_wins, total_earnings, total_buyins, current_streak, best_streak, worst_streak FROM players WHERE name=?", (name,))
         row = c.fetchone()
         if not row:
             continue
-        t, w, e, b = row
+        t, w, e, b, cur_streak, best_streak, worst_streak = row
         total_profit = e - b
         roi      = (total_profit / b * 100) if b > 0 else 0
         win_rate = (w / t * 100) if t > 0 else 0
         emoji    = place_map.get(place, f"#{place}")
+
+        # Streak display
+        if cur_streak > 0:
+            streak_line = f"🔥 {cur_streak} Siege in Folge!"
+        elif cur_streak < 0:
+            streak_line = f"🥶 {abs(cur_streak)} Niederlagen in Folge"
+        else:
+            streak_line = "➖ Streak: 0"
+
+        bounty_line = f"\n├ Bounties: {kills}x 💀 = +{bounty_earned:.0f}€" if kills > 0 else ""
+
         await context.bot.send_message(chat_id=int(chat_id), parse_mode="Markdown", text=(
             f"{emoji} *{name}* — Turnier #{tournament_id}\n"
             f"├ Platz {place} von {len(placements)}\n"
-            f"├ Payout: {payout:.2f}€  (Buy-In: {buyin:.2f}€)\n"
-            f"└ Heute: *{'+'if profit>=0 else ''}{profit:.2f}€*\n\n"
+            f"├ Payout: {payout:.2f}€  (Buy-In: {buyin:.2f}€)"
+            + bounty_line +
+            f"\n└ Heute: *{'+'if profit>=0 else ''}{profit:.2f}€*\n\n"
             f"📊 *Gesamtbilanz:*\n"
             f"├ {t} Turniere  |  {w} Siege  ({win_rate:.0f}% WR)\n"
-            f"├ Profit gesamt: *{'+'if total_profit>=0 else ''}{total_profit:.2f}€*\n"
-            f"└ ROI: *{'+'if roi>=0 else ''}{roi:.0f}%*"
+            f"├ Profit: *{'+'if total_profit>=0 else ''}{total_profit:.2f}€*  |  ROI: *{'+'if roi>=0 else ''}{roi:.0f}%*\n"
+            f"├ Best Streak: 🔥{best_streak}  |  Worst: 🥶{abs(worst_streak)}\n"
+            f"└ Aktuell: {streak_line}"
         ))
         await asyncio.sleep(0.4)
     conn.close()
@@ -891,7 +1043,10 @@ async def player_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ '{name}' nicht gefunden.")
         conn.close()
         return
-    _, pname, _, t, w, e, b = player
+    _, pname, _, t, w, e, b = player[:7]
+    cur_streak   = player[7] if len(player) > 7 else 0
+    best_streak  = player[8] if len(player) > 8 else 0
+    worst_streak = player[9] if len(player) > 9 else 0
     profit   = e - b
     roi      = (profit / b * 100) if b > 0 else 0
     win_rate = (w / t * 100) if t > 0 else 0
@@ -906,11 +1061,16 @@ async def player_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p = payout - bi; cum += p; cum_data.append(cum)
         recent_lines.append(f"  {place_map.get(place, str(place)+'.')} {date[:10]} Platz {place}  {'+'if p>=0 else ''}{p:.0f}€")
     profit_str = f"+{profit:.2f}€" if profit >= 0 else f"{profit:.2f}€"
+    streak_icon = "🔥" if cur_streak > 0 else ("🥶" if cur_streak < 0 else "➖")
+    streak_val  = abs(cur_streak)
     text = (
         f"👤 *{pname}*\n\n"
         f"🎮 {t} Turniere  |  🏆 {w} Siege  ({win_rate:.0f}% WR)\n"
         f"💰 Profit: *{profit_str}*  |  ROI: *{'+'if roi>=0 else ''}{roi:.0f}%*\n"
-        f"📊 Einnahmen: {e:.2f}€  |  Kosten: {b:.2f}€"
+        f"📊 Einnahmen: {e:.2f}€  |  Kosten: {b:.2f}€\n\n"
+        f"🏅 *Streaks:*\n"
+        f"  Aktuell: {streak_icon} {streak_val} {'Siege' if cur_streak >= 0 else 'Niederlagen'}\n"
+        f"  Best: 🔥{best_streak}  |  Worst: 🥶{abs(worst_streak)}"
     )
     if recent_lines:
         text += "\n\n📋 *Historie:*\n" + "\n".join(recent_lines[-10:])
@@ -1368,6 +1528,57 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_bustout(query, data[5:], context)
         return
 
+    # Bounty kill attribution
+    if data.startswith("bounty_"):
+        parts = data[7:].split("_", 1)
+        if parts[0] == "skip":
+            # No killer — just continue
+            busted_name = parts[1] if len(parts) > 1 else ""
+            players     = json.loads(db_get("active_players") or "[]")
+            busted      = json.loads(db_get("busted_players") or "[]")
+            remaining   = [p for p in players if p not in {b["name"] for b in busted}]
+            if len(remaining) == 1:
+                winner = remaining[0]
+                busted.append({"name": winner, "place": 1})
+                db_set("busted_players", json.dumps(busted))
+                await query.edit_message_text(
+                    f"🏆 *{winner} GEWINNT!*\n\n_/endtournament für die Auswertung_",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏁 Auswertung starten", callback_data="finish_tournament")]])
+                )
+            else:
+                await _send_bustout_menu(None, edit_fn=query.edit_message_text)
+            return
+        # killer_name _ busted_name
+        killer      = parts[0]
+        busted_name = parts[1] if len(parts) > 1 else ""
+        kills       = json.loads(db_get("bounty_kills") or "{}")
+        kills[killer] = kills.get(killer, 0) + 1
+        db_set("bounty_kills", json.dumps(kills))
+        bounty = float(db_get("bounty_amount") or "0")
+        await query.answer(f"🎯 {killer} bekommt {bounty:.0f}€ Bounty!")
+
+        # Check if game is over
+        players   = json.loads(db_get("active_players") or "[]")
+        busted    = json.loads(db_get("busted_players") or "[]")
+        remaining = [p for p in players if p not in {b["name"] for b in busted}]
+        if len(remaining) == 1:
+            winner = remaining[0]
+            busted.append({"name": winner, "place": 1})
+            db_set("busted_players", json.dumps(busted))
+            winner_kills        = kills.get(winner, 0)
+            winner_bounty_total = winner_kills * bounty
+            await query.edit_message_text(
+                f"🏆 *{winner} GEWINNT!*\n"
+                + (f"💀 {winner_kills} Bounties = +{winner_bounty_total:.0f}€\n" if winner_kills > 0 else "")
+                + "\n_/endtournament für die Auswertung_",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏁 Auswertung starten", callback_data="finish_tournament")]])
+            )
+        else:
+            await _send_bustout_menu(None, edit_fn=query.edit_message_text)
+        return
+
     if data == "finish_tournament":
         await query.edit_message_text("🏁 Turnier wird ausgewertet...")
         await _finalize_tournament(
@@ -1536,6 +1747,93 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
+#  SEATDRAW
+# ─────────────────────────────────────────────
+async def seatdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Randomly assign seats to all active players."""
+    import random
+    active = json.loads(db_get("active_players") or "[]")
+    if not active:
+        await update.message.reply_text("❌ Keine Spieler. /addplayer benutzen.")
+        return
+    shuffled = active[:]
+    random.shuffle(shuffled)
+    seat_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+    # Animated reveal — send "drawing..." first then edit
+    msg = await update.message.reply_text("🎲 *Ziehe Sitzplätze...*", parse_mode="Markdown")
+    await asyncio.sleep(1.5)
+
+    lines = [f"{seat_emojis[i] if i < len(seat_emojis) else str(i+1)+'.'} {name}"
+             for i, name in enumerate(shuffled)]
+    await msg.edit_text(
+        f"🎰 *Sitzplatz-Ziehung*\n\n" + "\n".join(lines) + "\n\n_Viel Glück allen!_ 🃏",
+        parse_mode="Markdown"
+    )
+
+
+# ─────────────────────────────────────────────
+#  HISTORY
+# ─────────────────────────────────────────────
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show tournament archive."""
+    # Optional: /history 10 for last 10
+    limit = 10
+    if context.args:
+        try:
+            limit = int(context.args[0])
+        except ValueError:
+            pass
+    limit = min(limit, 30)
+
+    conn = sqlite3.connect(DB_FILE)
+    c    = conn.cursor()
+    c.execute("""SELECT t.id, t.date, t.num_players, t.buyin_amount, t.total_pot, r.player_name
+                 FROM tournaments t
+                 LEFT JOIN results r ON r.tournament_id = t.id AND r.place = 1
+                 WHERE t.status = 'finished'
+                 ORDER BY t.date DESC LIMIT ?""", (limit,))
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text("📋 Noch keine abgeschlossenen Turniere.")
+        return
+
+    lines = []
+    for t_id, date, num_p, buyin, pot, winner in rows:
+        date_str = date[:10]
+        w = f"👑 {winner}" if winner else "?"
+        lines.append(f"#{t_id} | {date_str} | {num_p}P | {buyin:.0f}€ BI | {pot:.0f}€ Pot | {w}")
+
+    await update.message.reply_text(
+        f"📋 *Turnier-Archiv (letzte {len(rows)}):*\n\n`" + "\n".join(lines) + "`\n\n"
+        "_Details: `/history 20` für mehr_",
+        parse_mode="Markdown"
+    )
+
+
+# ─────────────────────────────────────────────
+#  AUTO BACKUP  (daily at midnight)
+# ─────────────────────────────────────────────
+async def auto_backup(context: ContextTypes.DEFAULT_TYPE):
+    """Send DB backup to all superadmins daily."""
+    if not os.path.exists(DB_FILE):
+        return
+    for uid in SUPERADMIN_IDS:
+        try:
+            with open(DB_FILE, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=uid,
+                    document=f,
+                    filename=f"poker_backup_{datetime.now().strftime('%Y%m%d')}.db",
+                    caption=f"💾 Auto-Backup — {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+                )
+        except Exception as e:
+            logging.warning(f"Auto-backup to {uid} failed: {e}")
+
+
+# ─────────────────────────────────────────────
 #  SAVE CHAT ID
 # ─────────────────────────────────────────────
 async def save_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1595,6 +1893,8 @@ def main():
     app.add_handler(CommandHandler("importdb",        import_db_cmd))
     # Info
     app.add_handler(CommandHandler("changelog",       changelog_cmd))
+    app.add_handler(CommandHandler("seatdraw",        seatdraw_cmd))
+    app.add_handler(CommandHandler("history",         history_cmd))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(button_callback))
@@ -1603,10 +1903,16 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.ALL & ~filters.Document.ALL, save_chat_id))
 
-    # Background job
+    # Background jobs
     app.job_queue.run_repeating(check_blind_timer, interval=30, first=10)
 
-    print("🃏 CDVPoker Bot v4.0 gestartet!")
+    # Auto-backup daily at midnight
+    now = datetime.now()
+    midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    seconds_until_midnight = (midnight - now).total_seconds()
+    app.job_queue.run_repeating(auto_backup, interval=86400, first=seconds_until_midnight)
+
+    print("🃏 CDVPoker Bot v5.0 gestartet!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
