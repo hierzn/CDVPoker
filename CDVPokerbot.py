@@ -21,6 +21,7 @@ import io
 import json
 import logging
 import os
+import requests
 import shutil
 import sqlite3
 import tempfile
@@ -41,6 +42,9 @@ DB_FILE   = os.environ.get("DB_PATH", "poker_tournament.db")
 
 _raw_ids = os.environ.get("SUPERADMIN_IDS", "")
 SUPERADMIN_IDS: set[int] = {int(x.strip()) for x in _raw_ids.split(",") if x.strip().isdigit()}
+
+POKER_WEBSITE_URL = os.environ.get("POKER_WEBSITE_URL", "").rstrip("/")
+POKER_API_TOKEN   = os.environ.get("POKER_API_TOKEN", "")
 
 # ─────────────────────────────────────────────
 #  CHANGELOG  ← update this when you deploy!
@@ -299,6 +303,55 @@ def db_del(key: str):
     c.execute("DELETE FROM bot_state WHERE key=?", (key,))
     conn.commit()
     conn.close()
+
+
+def _do_sync_request(payload: dict):
+    if not POKER_WEBSITE_URL or not POKER_API_TOKEN:
+        return
+    try:
+        requests.post(f"{POKER_WEBSITE_URL}/api/update.php", json=payload, timeout=3)
+    except Exception:
+        pass
+
+
+async def sync_to_website(status: str = "running"):
+    if not POKER_WEBSITE_URL or not POKER_API_TOKEN:
+        return
+    try:
+        players     = json.loads(db_get("active_players") or "[]")
+        busted      = json.loads(db_get("busted_players") or "[]")
+        current_lvl = int(db_get("current_blind_level") or "1")
+        levels      = get_active_blind_levels()
+        level = levels[current_lvl - 1] if 1 <= current_lvl <= len(levels) else None
+        buyin     = float(db_get("buyin_amount") or "0")
+        num       = len(players)
+        total_pot = buyin * num
+        payouts   = []
+        if num > 0 and buyin > 0:
+            try:
+                payouts = get_payout_structure(num, buyin, total_pot)
+            except Exception:
+                pass
+        payload = {
+            "token":                  POKER_API_TOKEN,
+            "status":                 status,
+            "blind_level":            current_lvl,
+            "small_blind":            level["small"]   if level else 0,
+            "big_blind":              level["big"]     if level else 0,
+            "level_duration_minutes": level["minutes"] if level else 0,
+            "level_start_time":       db_get("blind_start_time") or "",
+            "active_players":         players,
+            "busted_players":         busted,
+            "total_players":          num,
+            "buyin":                  buyin,
+            "total_pot":              total_pot,
+            "bounty":                 float(db_get("bounty_amount") or "0"),
+            "payout_structure":       payouts,
+        }
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _do_sync_request, payload)
+    except Exception:
+        pass
 
 
 def clear_session():
@@ -708,6 +761,7 @@ async def _handle_bustout(query, name: str, context: ContextTypes.DEFAULT_TYPE):
     place     = len(remaining)
     busted.append({"name": name, "place": place})
     db_set("busted_players", json.dumps(busted))
+    await sync_to_website("running")
     await query.answer(f"💀 {name} — Platz {place}")
     remaining_after = [p for p in players if p not in {b["name"] for b in busted}]
 
@@ -766,6 +820,7 @@ async def end_tournament(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _finalize_tournament(reply_fn: Callable, context: ContextTypes.DEFAULT_TYPE):
     db_set("blind_running", "0")
+    await sync_to_website("finished")
 
     players     = json.loads(db_get("active_players") or "[]")
     busted      = json.loads(db_get("busted_players") or "[]")
@@ -1092,6 +1147,7 @@ async def shotclock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_set("current_blind_level", "1")
     db_set("blind_start_time", datetime.now().isoformat())
     db_set("blind_running", "1")
+    await sync_to_website("running")
     level    = get_active_blind_levels()[0]
     end_time = (datetime.now() + timedelta(minutes=level["minutes"])).strftime("%H:%M")
     keyboard = [[
@@ -1118,6 +1174,7 @@ async def _advance_level(reply_fn: Callable):
         return
     db_set("current_blind_level", str(nxt))
     db_set("blind_start_time", datetime.now().isoformat())
+    await sync_to_website("running")
     level    = levels[nxt - 1]
     prev     = levels[current - 1]
     end_time = (datetime.now() + timedelta(minutes=level["minutes"])).strftime("%H:%M")
