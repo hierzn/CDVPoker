@@ -324,6 +324,74 @@ def _do_sync_request(payload: dict):
         pass
 
 
+async def _web_bustout(name: str, context: ContextTypes.DEFAULT_TYPE, chat_id: str):
+    players      = json.loads(db_get("active_players") or "[]")
+    busted       = json.loads(db_get("busted_players") or "[]")
+    busted_names = {b["name"] for b in busted}
+    matched      = next((p for p in players if p.lower() == name.lower()), None)
+    if not matched or matched in busted_names:
+        return
+    remaining = [p for p in players if p not in busted_names]
+    place     = len(remaining)
+    busted.append({"name": matched, "place": place})
+    db_set("busted_players", json.dumps(busted))
+    remaining_after = [p for p in players if p not in {b["name"] for b in busted}]
+    if chat_id:
+        await context.bot.send_message(int(chat_id), f"💀 *{matched}* — Platz {place} _(App)_", parse_mode="Markdown")
+    if len(remaining_after) == 1:
+        winner = remaining_after[0]
+        busted.append({"name": winner, "place": 1})
+        db_set("busted_players", json.dumps(busted))
+        if chat_id:
+            await context.bot.send_message(int(chat_id), f"🏆 *{winner} GEWINNT!*\n\n_/endtournament für die Auswertung_", parse_mode="Markdown")
+    await sync_to_website("running")
+
+
+def _fetch_web_commands_sync() -> list:
+    if not POKER_WEBSITE_URL or not POKER_API_TOKEN:
+        return []
+    try:
+        r = requests.get(
+            f"{POKER_WEBSITE_URL}/api/command.php",
+            params={"token": POKER_API_TOKEN},
+            timeout=3
+        )
+        return r.json() if r.ok else []
+    except Exception:
+        return []
+
+
+async def check_web_commands(context: ContextTypes.DEFAULT_TYPE):
+    loop     = asyncio.get_event_loop()
+    commands = await loop.run_in_executor(None, _fetch_web_commands_sync)
+    if not commands:
+        return
+    chat_id = db_get("main_chat_id")
+    for item in commands:
+        cmd = item.get("cmd", "")
+        try:
+            if cmd == "stop":
+                db_set("blind_running", "0")
+                await sync_to_website("running")
+                if chat_id:
+                    await context.bot.send_message(int(chat_id), "⏹ Timer gestoppt _(App)_", parse_mode="Markdown")
+            elif cmd == "resume":
+                db_set("blind_running", "1")
+                db_set("blind_start_time", datetime.now().isoformat())
+                await sync_to_website("running")
+                if chat_id:
+                    await context.bot.send_message(int(chat_id), "▶️ Timer fortgesetzt _(App)_", parse_mode="Markdown")
+            elif cmd == "next_level":
+                async def reply_fn(text, **kwargs):
+                    if chat_id:
+                        await context.bot.send_message(int(chat_id), text, **kwargs)
+                await _advance_level(reply_fn)
+            elif cmd == "bustout":
+                await _web_bustout(item.get("player", ""), context, chat_id)
+        except Exception:
+            pass
+
+
 async def sync_to_website(status: str = "running"):
     if not POKER_WEBSITE_URL or not POKER_API_TOKEN:
         return
@@ -1983,7 +2051,8 @@ def main():
     app.add_handler(MessageHandler(filters.ALL & ~filters.Document.ALL, save_chat_id))
 
     # Background jobs
-    app.job_queue.run_repeating(check_blind_timer, interval=30, first=10)
+    app.job_queue.run_repeating(check_blind_timer,   interval=30, first=10)
+    app.job_queue.run_repeating(check_web_commands,  interval=5,  first=5)
 
     # Auto-backup daily at midnight
     now = datetime.now()
