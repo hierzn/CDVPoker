@@ -1531,6 +1531,7 @@ async def check_blind_timer(context: ContextTypes.DEFAULT_TYPE):
     start_str   = db_get("blind_start_time")
     if not current_str or not start_str:
         return
+    await sync_to_website("running")
     levels  = get_active_blind_levels()
     current = int(current_str)
     if current > len(levels):
