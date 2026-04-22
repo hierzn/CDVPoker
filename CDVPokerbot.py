@@ -1181,6 +1181,8 @@ async def _advance_level(reply_fn: Callable):
     keyboard = [[
         InlineKeyboardButton("⏭ Nächstes Level", callback_data="next_level"),
         InlineKeyboardButton("⏱ Zeit", callback_data="time_left"),
+    ],[
+        InlineKeyboardButton("📋 Alle Level", callback_data="all_levels"),
     ]]
     await reply_fn(
         f"⏭ *Level {nxt} — Blinds erhöht!*\n\n"
@@ -1225,9 +1227,9 @@ async def blind_structure_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     levels  = get_active_blind_levels()
     current = int(db_get("current_blind_level") or "0")
     lines   = [
-        f"Lvl {l['level']:2d} | {l['small']:>5,}/{l['big']:>6,} | {l['minutes']:2d}min"
-        + (" ◀️" if l['level'] == current else "")
-        for l in levels
+        f"Lvl {i+1:2d} | {l['small']:>5,}/{l['big']:>6,} | {l['minutes']:2d}min"
+        + (" ◀️" if i + 1 == current else "")
+        for i, l in enumerate(levels)
     ]
     await update.message.reply_text("📋 *Blind-Struktur:*\n\n`" + "\n".join(lines) + "`", parse_mode="Markdown")
 
@@ -1675,8 +1677,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "all_levels":
         levels  = get_active_blind_levels()
         current = int(db_get("current_blind_level") or "0")
-        lines   = [f"Lvl {l['level']:2d} | {l['small']:>5,}/{l['big']:>6,} | {l['minutes']:2d}min" + (" ◀️" if l['level'] == current else "") for l in levels]
-        await query.edit_message_text("📋 *Blind-Struktur:*\n\n`" + "\n".join(lines) + "`", parse_mode="Markdown")
+        lines   = [
+            f"Lvl {i+1:2d} | {l['small']:>5,}/{l['big']:>6,} | {l['minutes']:2d}min"
+            + (" ◀️" if i + 1 == current else "")
+            for i, l in enumerate(levels)
+        ]
+        keyboard = [[InlineKeyboardButton("🔙 Zurück", callback_data="time_left")]]
+        await query.edit_message_text(
+            "📋 *Blind-Struktur:*\n\n`" + "\n".join(lines) + "`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return
 
     # Player menu
