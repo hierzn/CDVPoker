@@ -51,6 +51,16 @@ POKER_API_TOKEN   = os.environ.get("POKER_API_TOKEN", "")
 # ─────────────────────────────────────────────
 CHANGELOG = [
     {
+        "version": "v5.1",
+        "date": "2026-04",
+        "changes": [
+            "🆕 poker.reflink.at — Live Shot Clock & Turnier-Info als PWA",
+            "🆕 Website-Sync — Bot pusht Spielstand alle 30s automatisch",
+            "🔧 Blind-Level Marker in Übersicht jetzt korrekt",
+            "🔧 📋 Alle Level Button auch nach Level-Wechsel verfügbar",
+        ],
+    },
+    {
         "version": "v5.0",
         "date": "2026-04",
         "changes": [
@@ -339,7 +349,7 @@ async def sync_to_website(status: str = "running"):
             "small_blind":            level["small"]   if level else 0,
             "big_blind":              level["big"]     if level else 0,
             "level_duration_minutes": level["minutes"] if level else 0,
-            "level_start_time":       db_get("blind_start_time") or "",
+            "level_start_time":       (db_get("blind_start_time") or "") + "Z",
             "active_players":         players,
             "busted_players":         busted,
             "total_players":          num,
