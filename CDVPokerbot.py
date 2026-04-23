@@ -232,16 +232,13 @@ BLIND_STEPS = [
     (25, 50), (50, 100), (75, 150), (100, 200), (150, 300),
     (200, 400), (300, 600), (400, 800), (500, 1000), (750, 1500),
     (1000, 2000), (1500, 3000), (2000, 4000), (3000, 6000), (5000, 10000),
+    (7500, 15000), (10000, 20000), (15000, 30000), (20000, 40000), (30000, 60000),
 ]
 
 
 def build_blind_levels(total_minutes: int) -> list[dict]:
-    if total_minutes <= 90:    num_levels = 8
-    elif total_minutes <= 150: num_levels = 10
-    elif total_minutes <= 240: num_levels = 12
-    else:                      num_levels = 14
-    num_levels = min(num_levels, len(BLIND_STEPS))
-    early_factor, num_early = 1.4, 3
+    num_levels = min(20, len(BLIND_STEPS))
+    num_early, early_factor = 3, 1.4
     base = total_minutes / (num_early * early_factor + (num_levels - num_early))
     base = max(base, 5)
     levels = []
@@ -1318,11 +1315,15 @@ async def player_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def shotclock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update):
         return
-    db_set("current_blind_level", "1")
-    db_set("blind_start_time", datetime.now().isoformat())
-    db_set("blind_running", "1")
+    already_running = db_get("blind_running") == "1" and bool(db_get("current_blind_level"))
+    if not already_running:
+        db_set("current_blind_level", "1")
+        db_set("blind_start_time", datetime.now().isoformat())
+        db_set("blind_running", "1")
     await sync_to_website("running")
-    level    = get_active_blind_levels()[0]
+    current_lvl = int(db_get("current_blind_level") or "1")
+    levels   = get_active_blind_levels()
+    level    = levels[current_lvl - 1]
     end_time = (datetime.now() + timedelta(minutes=level["minutes"])).strftime("%H:%M")
     keyboard = [[
         InlineKeyboardButton("⏭ Nächstes Level", callback_data="next_level"),
@@ -1331,8 +1332,12 @@ async def shotclock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("⏱ Zeit prüfen", callback_data="time_left"),
         InlineKeyboardButton("📋 Alle Level", callback_data="all_levels"),
     ]]
+    if already_running:
+        header = f"⏱ *Shot Clock l\xe4uft — Level {current_lvl}*"
+    else:
+        header = f"⏱ *Shot Clock gestartet!*\n\n*Level {current_lvl}*"
     await update.message.reply_text(
-        f"⏱ *Shot Clock gestartet!*\n\n*Level {level['level']}*\n"
+        f"{header}\n"
         f"🔵 Small: {level['small']:,}  🔴 Big: {level['big']:,}\n"
         f"⏰ {level['minutes']} min  |  Ende: {end_time}",
         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)
