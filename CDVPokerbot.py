@@ -169,6 +169,33 @@ def _save_player_to_website_sync(name: str, email: str = ""):
         pass
 
 
+def _save_result_to_website_sync(placements: list, payouts: dict, buyin: float,
+                                   bounty: float, bounty_kills: dict, total_pot: float) -> None:
+    """POST finished tournament result to website api/history.php."""
+    if not POKER_WEBSITE_URL or not POKER_API_TOKEN:
+        return
+    try:
+        player_data = []
+        for i, name in enumerate(placements):
+            place = i + 1
+            base_payout   = payouts.get(place, 0.0)
+            bounty_earned = bounty_kills.get(name, 0) * bounty
+            player_data.append({"name": name, "place": place, "payout": round(base_payout + bounty_earned, 2)})
+        requests.post(
+            f"{POKER_WEBSITE_URL}/api/history.php",
+            json={
+                "token":     POKER_API_TOKEN,
+                "date":      datetime.now().strftime("%Y-%m-%d"),
+                "buyin":     round(buyin + (bounty if bounty > 0 else 0), 2),
+                "total_pot": round(total_pot, 2),
+                "players":   player_data,
+            },
+            timeout=5
+        )
+    except Exception:
+        pass
+
+
 def _restore_state_from_website_sync():
     """On bot startup: restore an in-progress tournament from the website state."""
     if not POKER_WEBSITE_URL or not POKER_API_TOKEN:
@@ -1094,6 +1121,7 @@ async def _finalize_tournament(reply_fn: Callable, context: ContextTypes.DEFAULT
             os.remove(chart)
 
     await _send_player_summaries(context, placements, payouts, buyin, tournament_id, bounty_kills, bounty)
+    _save_result_to_website_sync(placements, payouts, buyin, bounty, bounty_kills, total_pot)
     clear_session()
 
 
