@@ -139,10 +139,64 @@ CHIPSETS = {
 # ─────────────────────────────────────────────
 #  PRESET PLAYERS  ← hier anpassen!
 # ─────────────────────────────────────────────
-PRESET_PLAYERS = [
-    "Dominik", "Alex", "Max", "Jonas", "Lukas",
-    "Stefan", "Michael", "Thomas", "David", "Florian",
-]
+def _fetch_roster_sync() -> list[str]:
+    """Fetch the permanent player roster from the website. Returns list of names."""
+    if not POKER_WEBSITE_URL or not POKER_API_TOKEN:
+        return []
+    try:
+        resp = requests.get(
+            f"{POKER_WEBSITE_URL}/api/players.php",
+            params={"token": POKER_API_TOKEN},
+            timeout=4
+        )
+        data = resp.json()
+        return [p["name"] for p in data if p.get("name")]
+    except Exception:
+        return []
+
+
+def _save_player_to_website_sync(name: str, email: str = ""):
+    """Persist a player name (and optional email) to the website roster."""
+    if not POKER_WEBSITE_URL or not POKER_API_TOKEN:
+        return
+    try:
+        requests.post(
+            f"{POKER_WEBSITE_URL}/api/players.php",
+            json={"token": POKER_API_TOKEN, "name": name, "email": email or None},
+            timeout=4
+        )
+    except Exception:
+        pass
+
+
+def _restore_state_from_website_sync():
+    """On bot startup: restore an in-progress tournament from the website state."""
+    if not POKER_WEBSITE_URL or not POKER_API_TOKEN:
+        return
+    try:
+        resp  = requests.get(f"{POKER_WEBSITE_URL}/api/state.php", timeout=5)
+        state = resp.json()
+        if state.get("status") != "running":
+            return
+        players = state.get("active_players") or []
+        busted  = state.get("busted_players") or []
+        level   = state.get("blind_level", 1)
+        ts      = (state.get("level_start_time") or "").rstrip("Z")
+        if players:
+            db_set("active_players",       json.dumps(players))
+        if busted:
+            db_set("busted_players",       json.dumps(busted))
+        if level:
+            db_set("current_blind_level",  str(level))
+        if ts:
+            db_set("blind_start_time",     ts)
+        db_set("blind_running", "1")
+        logging.info(
+            f"✅ State restored from website: level {level}, "
+            f"{len(players)} players, {len(busted)} busted"
+        )
+    except Exception as e:
+        logging.warning(f"⚠️  Could not restore state from website: {e}")
 
 # ─────────────────────────────────────────────
 #  BLIND STEPS
@@ -620,7 +674,9 @@ def _build_player_keyboard(active: list) -> list:
     c.execute("SELECT name FROM players ORDER BY total_tournaments DESC, name ASC")
     db_players = [row[0] for row in c.fetchall()]
     conn.close()
-    all_known = list(dict.fromkeys(PRESET_PLAYERS + db_players))
+    website_roster = _fetch_roster_sync()
+    # Website roster first (permanent), then SQLite history; deduplicated, preserving order
+    all_known = list(dict.fromkeys(website_roster + db_players))
     keyboard = []
     row = []
     for name in all_known:
@@ -638,7 +694,7 @@ def _build_player_keyboard(active: list) -> list:
     return keyboard
 
 
-def _toggle_player(name: str):
+def _toggle_player(name: str, email: str = ""):
     active = json.loads(db_get("active_players") or "[]")
     conn = sqlite3.connect(DB_FILE)
     conn.execute("INSERT OR IGNORE INTO players (name) VALUES (?)", (name,))
@@ -648,17 +704,29 @@ def _toggle_player(name: str):
         active.remove(name)
     else:
         active.append(name)
+        # Persist to website roster so this player is remembered across restarts
+        _save_player_to_website_sync(name, email)
     db_set("active_players", json.dumps(active))
 
 
 async def add_player_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
-        name = " ".join(context.args).strip()
-        _toggle_player(name)
+        # Last arg is treated as email if it contains '@', rest is the name
+        args  = context.args
+        email = ""
+        if args and "@" in args[-1]:
+            email = args[-1].strip()
+            args  = args[:-1]
+        name = " ".join(args).strip()
+        if not name:
+            await update.message.reply_text("❌ Bitte einen Namen angeben.")
+            return
+        _toggle_player(name, email)
         active = json.loads(db_get("active_players") or "[]")
         action = "hinzugefügt" if name in active else "entfernt"
+        extra  = f" _(gespeichert mit {email})_" if email and name in active else ""
         await update.message.reply_text(
-            f"✅ *{name}* {action}! ({len(active)} Spieler)",
+            f"✅ *{name}* {action}!{extra} ({len(active)} Spieler)",
             parse_mode="Markdown"
         )
     else:
@@ -2003,6 +2071,7 @@ def main():
 
     logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
     init_db()
+    _restore_state_from_website_sync()  # Recover in-progress tournament after restart
 
     app = Application.builder().token(BOT_TOKEN).build()
 
