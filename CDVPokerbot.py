@@ -55,6 +55,35 @@ _processed_cmd_ids: set[str] = set()  # dedup — prevents same command firing t
 # ─────────────────────────────────────────────
 CHANGELOG = [
     {
+        "version": "v5.6",
+        "date": "2026-04",
+        "changes": [
+            "🔧 Bustout-Delay gefixt — Website aktualisiert sofort, nicht erst nach 30s",
+            "🔧 Nächstes-Level Endlos-Sprung gefixt — Command-ID Dedup verhindert Doppelverarbeitung",
+            "🔧 CET-Zeitzone — Blind-Endzeiten in Telegram jetzt korrekt (Europe/Vienna)",
+            "🆕 Shotclock: Buy-In + Bounty-Betrag direkt in der Anzeige sichtbar",
+            "🆕 PWA Install-Banner — iOS Anleitung & Android Installieren-Button",
+            "🆕 Termine: Terminoptionen als Datum-Picker (statt Freitext), editierbar",
+            "🆕 Termine: Abstimmung auch für nicht eingeloggte Benutzer per Name",
+        ],
+    },
+    {
+        "version": "v5.5",
+        "date": "2026-04",
+        "changes": [
+            "🔧 api/command.php: flock() statt rename() — Web-Commands funktionieren auf NFS",
+            "🔧 Bustout via App überträgt jetzt korrekt an Telegram",
+            "🆕 Status 'results' — Siegerscreen in Shotclock nach letztem Bustout",
+            "🆕 Turnier beenden-Button in Shotclock PWA (Admin-Modus)",
+            "🆕 Bounty-Modus: Killer-Auswahl nach Bustout in der App",
+            "🔧 Sieger wird korrekt im Preisgeld-Panel angezeigt (Place=1 Sync)",
+            "🔧 Blind-Level: 10 Hauptlevel (decken Turnierdauer) + 10 Overtime-Level",
+            "🔧 check_blind_timer: 10s Guard verhindert Race-Condition bei manuellem Advance",
+            "🔧 Spielernamen case-insensitive bei Bustout-Verarbeitung",
+            "🆕 /endtournament via Web-Command aus PWA steuerbar",
+        ],
+    },
+    {
         "version": "v5.1",
         "date": "2026-04",
         "changes": [
