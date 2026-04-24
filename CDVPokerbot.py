@@ -237,15 +237,23 @@ BLIND_STEPS = [
 
 
 def build_blind_levels(total_minutes: int) -> list[dict]:
-    num_levels = min(20, len(BLIND_STEPS))
+    main_count, extra_count = 10, 10
     num_early, early_factor = 3, 1.4
-    base = total_minutes / (num_early * early_factor + (num_levels - num_early))
+    # Distribute total_minutes across main levels only
+    base = total_minutes / (num_early * early_factor + (main_count - num_early))
     base = max(base, 5)
     levels = []
-    for i in range(num_levels):
+    for i in range(main_count):
         small, big = BLIND_STEPS[i]
         mins = round(base * early_factor) if i < num_early else round(base)
         levels.append({"level": i + 1, "minutes": max(mins, 5), "small": small, "big": big})
+    # Overtime levels: fixed 10 min each (or 60% of base if base is large)
+    overtime_mins = max(10, round(base * 0.6))
+    for i in range(main_count, main_count + extra_count):
+        if i >= len(BLIND_STEPS):
+            break
+        small, big = BLIND_STEPS[i]
+        levels.append({"level": i + 1, "minutes": overtime_mins, "small": small, "big": big})
     return levels
 
 
@@ -402,7 +410,7 @@ def _do_sync_request(payload: dict):
         pass
 
 
-async def _web_bustout(name: str, context: ContextTypes.DEFAULT_TYPE, chat_id: str):
+async def _web_bustout(name: str, context: ContextTypes.DEFAULT_TYPE, chat_id: str, killer: str = ""):
     players      = json.loads(db_get("active_players") or "[]")
     busted       = json.loads(db_get("busted_players") or "[]")
     busted_names = {b["name"] for b in busted}
@@ -413,6 +421,10 @@ async def _web_bustout(name: str, context: ContextTypes.DEFAULT_TYPE, chat_id: s
     place     = len(remaining)
     busted.append({"name": matched, "place": place})
     db_set("busted_players", json.dumps(busted))
+    if killer:
+        kills = json.loads(db_get("bounty_kills") or "{}")
+        kills[killer] = kills.get(killer, 0) + 1
+        db_set("bounty_kills", json.dumps(kills))
     remaining_after = [p for p in players if p not in {b["name"] for b in busted}]
     if chat_id:
         await context.bot.send_message(int(chat_id), f"💀 *{matched}* — Platz {place} _(App)_", parse_mode="Markdown")
@@ -422,7 +434,9 @@ async def _web_bustout(name: str, context: ContextTypes.DEFAULT_TYPE, chat_id: s
         db_set("busted_players", json.dumps(busted))
         if chat_id:
             await context.bot.send_message(int(chat_id), f"🏆 *{winner} GEWINNT!*\n\n_/endtournament für die Auswertung_", parse_mode="Markdown")
-    await sync_to_website("running")
+        await sync_to_website("results")
+    else:
+        await sync_to_website("running")
 
 
 def _fetch_web_commands_sync() -> list:
@@ -465,7 +479,13 @@ async def check_web_commands(context: ContextTypes.DEFAULT_TYPE):
                         await context.bot.send_message(int(chat_id), text, **kwargs)
                 await _advance_level(reply_fn)
             elif cmd == "bustout":
-                await _web_bustout(item.get("player", ""), context, chat_id)
+                await _web_bustout(item.get("player", ""), context, chat_id, item.get("killer", ""))
+            elif cmd == "end_tournament":
+                if db_get("blind_running") in ("1", "0"):
+                    async def reply_fn(text, **kwargs):
+                        if chat_id:
+                            await context.bot.send_message(int(chat_id), text, **kwargs)
+                    await _finalize_tournament(reply_fn, context)
         except Exception:
             pass
 
@@ -921,12 +941,16 @@ async def _handle_bustout(query, name: str, context: ContextTypes.DEFAULT_TYPE):
     players      = json.loads(db_get("active_players") or "[]")
     busted       = json.loads(db_get("busted_players") or "[]")
     busted_names = {b["name"] for b in busted}
-    if name not in players:
+    # Case-insensitive matching — find actual stored name
+    players_ci = {p.lower(): p for p in players}
+    matched = players_ci.get(name.lower())
+    if not matched:
         await query.answer(f"❌ {name} ist kein aktiver Spieler!")
         return
-    if name in busted_names:
-        await query.answer(f"⚠️ {name} bereits ausgeschieden!")
+    if matched in busted_names:
+        await query.answer(f"⚠️ {matched} bereits ausgeschieden!")
         return
+    name = matched
     remaining = [p for p in players if p not in busted_names]
     place     = len(remaining)
     busted.append({"name": name, "place": place})
@@ -959,6 +983,7 @@ async def _handle_bustout(query, name: str, context: ContextTypes.DEFAULT_TYPE):
         winner = remaining_after[0]
         busted.append({"name": winner, "place": 1})
         db_set("busted_players", json.dumps(busted))
+        await sync_to_website("results")
         await query.edit_message_text(
             f"🏆 *{winner} GEWINNT!*\n\nLetzter Bustout: 💀 {name} (Platz {place})\n\n_/endtournament für die Auswertung_",
             parse_mode="Markdown",
@@ -990,7 +1015,6 @@ async def end_tournament(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _finalize_tournament(reply_fn: Callable, context: ContextTypes.DEFAULT_TYPE):
     db_set("blind_running", "0")
-    await sync_to_website("finished")
 
     players     = json.loads(db_get("active_players") or "[]")
     busted      = json.loads(db_get("busted_players") or "[]")
@@ -1120,6 +1144,7 @@ async def _finalize_tournament(reply_fn: Callable, context: ContextTypes.DEFAULT
     await _send_player_summaries(context, placements, payouts, buyin, tournament_id, bounty_kills, bounty)
     _save_result_to_website_sync(placements, payouts, buyin, bounty, bounty_kills, total_pot)
     clear_session()
+    await sync_to_website("idle")
 
 
 # ─────────────────────────────────────────────
@@ -1353,6 +1378,7 @@ async def _advance_level(reply_fn: Callable):
         return
     db_set("current_blind_level", str(nxt))
     db_set("blind_start_time", datetime.now().isoformat())
+    db_set("last_advance_time", datetime.now().isoformat())
     await sync_to_website("running")
     level    = levels[nxt - 1]
     prev     = levels[current - 1]
@@ -1734,10 +1760,19 @@ async def check_blind_timer(context: ContextTypes.DEFAULT_TYPE):
             )
 
     if elapsed >= dur:
+        last_adv = db_get("last_advance_time")
+        if last_adv:
+            try:
+                since_adv = (datetime.now() - datetime.fromisoformat(last_adv)).total_seconds()
+                if since_adv < 10:
+                    return
+            except Exception:
+                pass
         nxt = current + 1
         if nxt <= len(levels):
             db_set("current_blind_level", str(nxt))
             db_set("blind_start_time", datetime.now().isoformat())
+            db_set("last_advance_time", datetime.now().isoformat())
             db_del(f"warned_{current}")
             next_level = levels[nxt - 1]
             chat_id    = db_get("main_chat_id")
@@ -1780,12 +1815,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 winner = remaining[0]
                 busted.append({"name": winner, "place": 1})
                 db_set("busted_players", json.dumps(busted))
+                await sync_to_website("results")
                 await query.edit_message_text(
                     f"🏆 *{winner} GEWINNT!*\n\n_/endtournament für die Auswertung_",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏁 Auswertung starten", callback_data="finish_tournament")]])
                 )
             else:
+                await sync_to_website("running")
                 await _send_bustout_menu(None, edit_fn=query.edit_message_text)
             return
         # killer_name _ busted_name
@@ -1807,6 +1844,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db_set("busted_players", json.dumps(busted))
             winner_kills        = kills.get(winner, 0)
             winner_bounty_total = winner_kills * bounty
+            await sync_to_website("results")
             await query.edit_message_text(
                 f"🏆 *{winner} GEWINNT!*\n"
                 + (f"💀 {winner_kills} Bounties = +{winner_bounty_total:.0f}€\n" if winner_kills > 0 else "")
@@ -1815,6 +1853,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏁 Auswertung starten", callback_data="finish_tournament")]])
             )
         else:
+            await sync_to_website("running")
             await _send_bustout_menu(None, edit_fn=query.edit_message_text)
         return
 
