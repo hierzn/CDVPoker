@@ -27,6 +27,7 @@ import sqlite3
 import tempfile
 from datetime import datetime, timedelta
 from typing import Optional, Callable
+from zoneinfo import ZoneInfo
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Document
 from telegram.ext import (
@@ -45,6 +46,9 @@ SUPERADMIN_IDS: set[int] = {int(x.strip()) for x in _raw_ids.split(",") if x.str
 
 POKER_WEBSITE_URL = os.environ.get("POKER_WEBSITE_URL", "").rstrip("/")
 POKER_API_TOKEN   = os.environ.get("POKER_API_TOKEN", "")
+
+CET = ZoneInfo("Europe/Vienna")
+_processed_cmd_ids: set[str] = set()  # dedup — prevents same command firing twice if flock hiccups
 
 # ─────────────────────────────────────────────
 #  CHANGELOG  ← update this when you deploy!
@@ -426,17 +430,18 @@ async def _web_bustout(name: str, context: ContextTypes.DEFAULT_TYPE, chat_id: s
         kills[killer] = kills.get(killer, 0) + 1
         db_set("bounty_kills", json.dumps(kills))
     remaining_after = [p for p in players if p not in {b["name"] for b in busted}]
-    if chat_id:
-        await context.bot.send_message(int(chat_id), f"💀 *{matched}* — Platz {place} _(App)_", parse_mode="Markdown")
     if len(remaining_after) == 1:
         winner = remaining_after[0]
         busted.append({"name": winner, "place": 1})
         db_set("busted_players", json.dumps(busted))
+        await sync_to_website("results")  # update website FIRST, before slow Telegram call
         if chat_id:
+            await context.bot.send_message(int(chat_id), f"💀 *{matched}* — Platz {place} _(App)_", parse_mode="Markdown")
             await context.bot.send_message(int(chat_id), f"🏆 *{winner} GEWINNT!*\n\n_/endtournament für die Auswertung_", parse_mode="Markdown")
-        await sync_to_website("results")
     else:
-        await sync_to_website("running")
+        await sync_to_website("running")  # update website FIRST
+        if chat_id:
+            await context.bot.send_message(int(chat_id), f"💀 *{matched}* — Platz {place} _(App)_", parse_mode="Markdown")
 
 
 def _fetch_web_commands_sync() -> list:
@@ -454,12 +459,20 @@ def _fetch_web_commands_sync() -> list:
 
 
 async def check_web_commands(context: ContextTypes.DEFAULT_TYPE):
+    global _processed_cmd_ids
     loop     = asyncio.get_event_loop()
     commands = await loop.run_in_executor(None, _fetch_web_commands_sync)
     if not commands:
         return
     chat_id = db_get("main_chat_id")
     for item in commands:
+        cmd_id = item.get("id", "")
+        if cmd_id:
+            if cmd_id in _processed_cmd_ids:
+                continue
+            _processed_cmd_ids.add(cmd_id)
+            if len(_processed_cmd_ids) > 1000:
+                _processed_cmd_ids.clear()
         cmd = item.get("cmd", "")
         try:
             if cmd == "stop":
@@ -1349,7 +1362,7 @@ async def shotclock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_lvl = int(db_get("current_blind_level") or "1")
     levels   = get_active_blind_levels()
     level    = levels[current_lvl - 1]
-    end_time = (datetime.now() + timedelta(minutes=level["minutes"])).strftime("%H:%M")
+    end_time = (datetime.now(CET) + timedelta(minutes=level["minutes"])).strftime("%H:%M")
     keyboard = [[
         InlineKeyboardButton("⏭ Nächstes Level", callback_data="next_level"),
         InlineKeyboardButton("⏹ Stoppen", callback_data="stop_blind"),
@@ -1382,7 +1395,7 @@ async def _advance_level(reply_fn: Callable):
     await sync_to_website("running")
     level    = levels[nxt - 1]
     prev     = levels[current - 1]
-    end_time = (datetime.now() + timedelta(minutes=level["minutes"])).strftime("%H:%M")
+    end_time = (datetime.now(CET) + timedelta(minutes=level["minutes"])).strftime("%H:%M")
     keyboard = [[
         InlineKeyboardButton("⏭ Nächstes Level", callback_data="next_level"),
         InlineKeyboardButton("⏱ Zeit", callback_data="time_left"),
