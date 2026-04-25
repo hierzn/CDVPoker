@@ -55,6 +55,16 @@ _processed_cmd_ids: set[str] = set()  # dedup — prevents same command firing t
 # ─────────────────────────────────────────────
 CHANGELOG = [
     {
+        "version": "v5.7",
+        "date": "2026-04",
+        "changes": [
+            "🆕 /rivalries — Wer hat wen am öftesten eliminiert? Bounty-Kill-Statistik",
+            "🆕 Telegram-Erinnerung — Bot schickt täglich 10:00 Uhr Erinnerung für Termine morgen",
+            "🔧 Bounty-Killer wird jetzt korrekt aus PWA übertragen (command.php killer-Feld)",
+            "🆕 api/events.php — Termine aus Website für Bot abrufbar",
+        ],
+    },
+    {
         "version": "v5.6",
         "date": "2026-04",
         "changes": [
@@ -405,6 +415,13 @@ def init_db():
         key TEXT PRIMARY KEY,
         value TEXT
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS bounty_kills_detail (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tournament_id INTEGER DEFAULT 0,
+        killer_name TEXT NOT NULL,
+        victim_name TEXT NOT NULL,
+        ts TEXT DEFAULT (datetime('now'))
+    )""")
     conn.commit()
     conn.close()
 
@@ -458,6 +475,7 @@ async def _web_bustout(name: str, context: ContextTypes.DEFAULT_TYPE, chat_id: s
         kills = json.loads(db_get("bounty_kills") or "{}")
         kills[killer] = kills.get(killer, 0) + 1
         db_set("bounty_kills", json.dumps(kills))
+        _record_kill_detail(killer, matched)
     remaining_after = [p for p in players if p not in {b["name"] for b in busted}]
     if len(remaining_after) == 1:
         winner = remaining_after[0]
@@ -576,8 +594,15 @@ def clear_session():
     for key in ["active_players", "buyin_amount", "chip_config",
                 "current_blind_level", "blind_start_time", "blind_running",
                 "busted_players", "blind_levels", "tournament_duration",
-                "bounty_amount", "bounty_kills"]:
+                "bounty_amount", "bounty_kills", "bounty_kills_detail"]:
         db_del(key)
+
+
+def _record_kill_detail(killer: str, victim: str):
+    """Append a bounty kill (killer→victim) to bot_state for later DB persistence."""
+    details = json.loads(db_get("bounty_kills_detail") or "[]")
+    details.append({"killer": killer, "victim": victim})
+    db_set("bounty_kills_detail", json.dumps(details))
 
 
 # ─────────────────────────────────────────────
@@ -651,6 +676,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 *Statistik*\n"
         "`/stats` — Leaderboard\n"
         "`/playerstats [Name]` — Stats + Streaks + Grafik\n"
+        "`/rivalries` — Bounty-Rivalitäten 🎯\n"
         "`/history` — Turnier-Archiv\n"
         "`/status` — Turnierstatus\n\n"
         "🔑 *Admin*\n"
@@ -1088,6 +1114,14 @@ async def _finalize_tournament(reply_fn: Callable, context: ContextTypes.DEFAULT
     c.execute("INSERT INTO tournaments (num_players, buyin_amount, total_pot, chip_config, status, bounty_amount) VALUES (?,?,?,?,?,?)",
               (num_players, buyin, total_pot, db_get("chip_config") or "{}", "finished", bounty))
     tournament_id = c.lastrowid
+
+    # Persist individual kill details for rivalry tracking
+    kill_details = json.loads(db_get("bounty_kills_detail") or "[]")
+    for d in kill_details:
+        c.execute(
+            "INSERT INTO bounty_kills_detail (tournament_id, killer_name, victim_name) VALUES (?,?,?)",
+            (tournament_id, d["killer"], d["victim"])
+        )
 
     place_emoji  = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
     result_lines = []
@@ -1873,6 +1907,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kills       = json.loads(db_get("bounty_kills") or "{}")
         kills[killer] = kills.get(killer, 0) + 1
         db_set("bounty_kills", json.dumps(kills))
+        _record_kill_detail(killer, busted_name)
         bounty = float(db_get("bounty_amount") or "0")
         await query.answer(f"🎯 {killer} bekommt {bounty:.0f}€ Bounty!")
 
@@ -2143,6 +2178,120 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
+#  RIVALITÄTEN
+# ─────────────────────────────────────────────
+async def rivalries_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = sqlite3.connect(DB_FILE)
+    c    = conn.cursor()
+    c.execute("""
+        SELECT killer_name, victim_name, COUNT(*) AS cnt
+        FROM bounty_kills_detail
+        GROUP BY killer_name, victim_name
+        ORDER BY cnt DESC
+        LIMIT 15
+    """)
+    matchups = c.fetchall()
+    c.execute("""
+        SELECT killer_name, COUNT(*) AS total
+        FROM bounty_kills_detail
+        GROUP BY killer_name
+        ORDER BY total DESC
+        LIMIT 5
+    """)
+    top_killers = c.fetchall()
+    conn.close()
+
+    if not matchups:
+        await update.message.reply_text(
+            "🎯 *Rivalitäten*\n\n_Noch keine Bounty-Kills aufgezeichnet._",
+            parse_mode="Markdown"
+        )
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🎯 *Rivalitäten — Wer hat wen am öftesten eliminiert?*\n"]
+    for i, (killer, victim, cnt) in enumerate(matchups):
+        medal = medals[i] if i < len(medals) else f"{i+1}."
+        lines.append(f"{medal} *{killer}* → {victim}: {cnt}x 💀")
+
+    if top_killers:
+        lines.append("\n🏆 *Top-Killer (gesamt):*")
+        for i, (name, total) in enumerate(top_killers):
+            medal = medals[i] if i < len(medals) else f"{i+1}."
+            lines.append(f"{medal} {name}: {total}x 💀")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ─────────────────────────────────────────────
+#  TELEGRAM-ERINNERUNG  (daily at 10:00 CET)
+# ─────────────────────────────────────────────
+def _fetch_events_sync() -> list:
+    if not POKER_WEBSITE_URL or not POKER_API_TOKEN:
+        return []
+    try:
+        resp = requests.get(
+            f"{POKER_WEBSITE_URL}/api/events.php",
+            params={"token": POKER_API_TOKEN},
+            timeout=4
+        )
+        if resp.ok:
+            data = resp.json()
+            return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    return []
+
+
+async def send_event_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """Daily job at 10:00 CET: send Telegram reminder for events scheduled tomorrow."""
+    chat_id = db_get("main_chat_id")
+    if not chat_id:
+        return
+
+    tomorrow = (datetime.now(CET) + timedelta(days=1)).date()
+    loop   = asyncio.get_event_loop()
+    events = await loop.run_in_executor(None, _fetch_events_sync)
+
+    for event in events:
+        ev_date_str = event.get("date", "")
+        if not ev_date_str:
+            continue
+        try:
+            ev_date = datetime.fromisoformat(ev_date_str[:10]).date()
+        except Exception:
+            continue
+        if ev_date != tomorrow:
+            continue
+
+        title    = event.get("title", "Poker-Abend")
+        location = event.get("location", "")
+        ev_time  = event.get("time", "")
+
+        # Use first time_option label if available, else raw time field
+        time_str = ""
+        for opt in (event.get("time_options") or []):
+            lbl = opt.get("label", "")
+            if lbl:
+                time_str = f"\n🕐 {lbl}"
+                break
+        if not time_str and ev_time:
+            time_str = f"\n🕐 {ev_time} Uhr"
+
+        text = (
+            f"🃏 *Erinnerung: Poker morgen!*\n\n"
+            f"📅 *{title}*"
+            + (f"\n📍 {location}" if location else "")
+            + time_str
+            + f"\n\n_Wer ist dabei? {POKER_WEBSITE_URL}/termine.php_"
+        )
+        try:
+            await context.bot.send_message(int(chat_id), text, parse_mode="Markdown")
+        except Exception as e:
+            logging.warning(f"Event reminder send failed: {e}")
+
+
+# ─────────────────────────────────────────────
 #  AUTO BACKUP  (daily at midnight)
 # ─────────────────────────────────────────────
 async def auto_backup(context: ContextTypes.DEFAULT_TYPE):
@@ -2225,6 +2374,7 @@ def main():
     app.add_handler(CommandHandler("changelog",       changelog_cmd))
     app.add_handler(CommandHandler("seatdraw",        seatdraw_cmd))
     app.add_handler(CommandHandler("history",         history_cmd))
+    app.add_handler(CommandHandler("rivalries",       rivalries_cmd))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(button_callback))
@@ -2243,7 +2393,15 @@ def main():
     seconds_until_midnight = (midnight - now).total_seconds()
     app.job_queue.run_repeating(auto_backup, interval=86400, first=seconds_until_midnight)
 
-    print("🃏 CDVPoker Bot v5.0 gestartet!")
+    # Event reminders daily at 10:00 CET
+    now_cet   = datetime.now(CET)
+    target_10 = now_cet.replace(hour=10, minute=0, second=0, microsecond=0)
+    if now_cet >= target_10:
+        target_10 += timedelta(days=1)
+    secs_until_10 = (target_10 - now_cet).total_seconds()
+    app.job_queue.run_repeating(send_event_reminders, interval=86400, first=secs_until_10)
+
+    print("🃏 CDVPoker Bot v5.7 gestartet!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
